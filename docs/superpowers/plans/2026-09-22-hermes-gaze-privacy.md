@@ -2381,74 +2381,187 @@ git commit -m "build: add verified sidecar release pipeline"
 
 - [ ] **Step 1: Build a synthetic-only regression corpus**
 
-Include:
-- names;
-- emails;
-- phone numbers;
-- postal/location data;
-- organisations;
-- custom identifiers;
-- multilingual examples supported by configured NER/rulepacks;
-- Markdown;
-- JSON;
-- XML;
-- LaTeX;
-- source code;
-- tool calls;
-- nested structured payloads;
-- deliberately awkward stream split points.
+Use a versioned JSON fixture file with only synthetic data:
 
-No real personal data.
+```json
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "email-markdown",
+      "text": "Contact Ada Example at ada@example.invalid in York.",
+      "must_protect": ["Ada Example", "ada@example.invalid", "York"]
+    },
+    {
+      "id": "custom-order-json",
+      "text": "{\"customer\":\"Synthetic Person\",\"order\":\"ORD-123456\"}",
+      "must_protect": ["Synthetic Person", "ORD-123456"]
+    },
+    {
+      "id": "latex-tool",
+      "text": "\\author{Synthetic Author}\\email{author@example.invalid}",
+      "must_protect": ["Synthetic Author", "author@example.invalid"]
+    }
+  ]
+}
+```
+
+Expand the corpus with synthetic phone, postal/location, organisation, multilingual/rulepack-supported, XML, source-code, nested-payload, tool-call, and awkward stream-split cases. No record may contain real personal data.
 
 - [ ] **Step 2: Write an external-provider capture test**
 
-Run Hermes against a local fake external provider endpoint that records received request bytes. Assert:
-- fixture PII is absent from captured request;
-- Gaze tokens are present where expected;
-- Hermes-visible final response contains restored synthetic values;
-- event logs contain only classes/counts/metadata.
+Run Hermes against a local capture server whose provider ID is deliberately **not** trusted:
+
+```python
+def test_external_provider_capture_contains_no_raw_pii(hermes_privacy_harness, pii_cases):
+    capture = hermes_privacy_harness.fake_external_provider()
+    for case in pii_cases:
+        result = hermes_privacy_harness.run(case["text"], provider=capture.provider_id)
+        sent = capture.last_request_bytes()
+        for raw in case["must_protect"]:
+            assert raw.encode() not in sent
+        assert b"<" in sent or b"gaze-fake.invalid" in sent
+        assert all(raw in result.visible_text for raw in case["must_protect"])
+        assert not hermes_privacy_harness.logs_contain(case["must_protect"])
+```
+
+Also assert persisted events contain only request IDs, provider/model, classes/counts, policy hash, decision, latency and error codes.
 
 - [ ] **Step 3: Write the LaTeX/tool-call acceptance test**
 
-Fake provider returns a streamed `write_file` call whose arguments contain Gaze tokens split across provider chunks. Assert the completed tool call handed to Hermes contains the original synthetic name/email and valid JSON, and the resulting LaTeX source contains original values.
+Fake provider returns a streamed `write_file` call whose argument token is split across provider chunks:
+
+```python
+def test_streamed_write_file_arguments_restore_before_execution(hermes_privacy_harness, tmp_path):
+    provider = hermes_privacy_harness.fake_tool_provider(
+        tool_name="write_file",
+        output_path=tmp_path / "letter.tex",
+        split_every_byte=True,
+    )
+    result = hermes_privacy_harness.run(
+        "Write a LaTeX letter for Synthetic Author, author@example.invalid",
+        provider=provider.provider_id,
+    )
+    tool_call = result.executed_tools[-1]
+    args = json.loads(tool_call.arguments)
+    assert args["content"].find("Synthetic Author") >= 0
+    assert args["content"].find("author@example.invalid") >= 0
+    assert (tmp_path / "letter.tex").read_text("utf-8") == args["content"]
+```
 
 - [ ] **Step 4: Write crash/recovery acceptance test**
 
-1. clean a request and persist session;
-2. terminate sidecar;
-3. restart it with the same key;
-4. restore a response containing previous tokens;
-5. verify byte-exact recovery;
-6. restart with a wrong key and assert external calls for that session block.
+Exercise both successful and refused recovery:
+
+```python
+def test_sidecar_restart_recovers_session_but_wrong_key_blocks(harness):
+    token = harness.clean_and_persist("Synthetic Person <synthetic@example.invalid>")
+    harness.kill_sidecar()
+    harness.restart_sidecar(same_key=True)
+    assert harness.restore(token) == "Synthetic Person <synthetic@example.invalid>"
+
+    harness.kill_sidecar()
+    harness.restart_sidecar(same_key=False)
+    with pytest.raises(PrivacyBlockedError):
+        harness.send_external_followup(token)
+```
 
 - [ ] **Step 5: Write multi-profile isolation acceptance test**
 
-Profile A's token must not restore under Profile B. In dedicated-sidecar mode, assert each profile gets its configured process/endpoint and cannot access the other's snapshot directory.
+Profile A's token must not restore under Profile B, and dedicated mode must allocate separate endpoints:
+
+```python
+def test_profile_namespaces_and_dedicated_sidecars_are_isolated(harness):
+    a = harness.profile("alpha", sidecar_scope="profile")
+    b = harness.profile("beta", sidecar_scope="profile")
+    token = a.clean("alpha@example.invalid")
+    assert a.sidecar_endpoint != b.sidecar_endpoint
+    with pytest.raises(StrictRestoreError):
+        b.restore(token)
+    assert set(a.snapshot_files()).isdisjoint(set(b.snapshot_files()))
+```
 
 - [ ] **Step 6: Write mandatory compatibility acceptance test**
 
-Against an unpatched Hermes fixture, external calls must stop before provider invocation. Against a patched Hermes fixture, both fail-closed execution and live stream transform capability probes pass.
+Test both host versions explicitly:
+
+```python
+def test_unpatched_hermes_blocks_external_before_provider(unpatched_harness):
+    provider = unpatched_harness.fake_external_provider()
+    with pytest.raises(PrivacyBlockedError):
+        unpatched_harness.run("alice@example.invalid", provider=provider.provider_id)
+    assert provider.request_count == 0
+
+
+def test_patched_hermes_reports_required_capabilities(patched_harness):
+    caps = patched_harness.privacy_status()["capabilities"]
+    assert caps["fail_closed"] is True
+    assert caps["stream_text"] is True
+```
 
 - [ ] **Step 7: Write logging leak test**
 
-Capture Python and Rust logs while running the corpus. Assert none of the raw synthetic PII strings, API token, or encryption key appear.
+Capture Python and Rust logs while running the corpus:
+
+```python
+def test_logs_never_contain_sensitive_material(harness, pii_cases):
+    harness.run_corpus(pii_cases)
+    logs = harness.all_logs()
+    forbidden = [
+        raw
+        for case in pii_cases
+        for raw in case["must_protect"]
+    ] + [harness.api_token, harness.master_key_text]
+    for value in forbidden:
+        assert value not in logs
+```
 
 - [ ] **Step 8: Write operator documentation**
 
-README/install docs must cover:
-- one-click/hybrid Hermes installation;
-- native-first sidecar;
-- optional Docker/external sidecar modes;
-- trusted-local semantics;
-- fail-closed Hermes requirement;
-- NER first-run download and offline provisioning;
-- policy layering;
-- Desktop controls;
-- compatibility mode warning;
-- data-at-rest layout;
-- security reporting.
+Write the docs with these required headings:
 
-Threat model must explicitly state that Hermes/local host are trusted and external model providers are outside the privacy boundary.
+```text
+README.md
+  Install in Hermes
+  How protection works
+  Trusted local providers
+  Desktop privacy console
+  Compatibility and Hermes version
+
+docs/install.md
+  Native-first installation
+  Docker mode
+  External sidecar mode
+  NER first-run download
+  Offline model provisioning
+  Secret files and generated fallbacks
+
+docs/architecture.md
+  Trust boundary
+  Request clean flow
+  Streaming restore flow
+  Session persistence
+  Profile isolation
+  Policy layering
+
+docs/debugging.md
+  Health and protocol checks
+  Blocked external request diagnostics
+  Policy validation
+  Snapshot recovery
+  Sensitive reveal controls
+
+docs/threat-model.md
+  Trusted components
+  Untrusted external providers
+  Protected data
+  Out-of-scope host compromise
+  Failure-closed guarantees
+```
+
+`SECURITY.md` documents vulnerability reporting and never claims that installing the plugin by itself makes a deployment GDPR compliant. The threat model explicitly states that Hermes/local host are trusted and external model providers are outside the privacy boundary.
+
+Manual Desktop QA before release: reveal one synthetic event, switch profile, verify it clears; reveal again, navigate away/unmount, verify it clears; reveal again, disconnect the backend, verify it clears.
 
 - [ ] **Step 9: Run the full release gate**
 
