@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-22  
 **Repository:** `Elliot-Construct/gaze-hermes-privacy`  
-**Status:** Conversational design approved; written specification awaiting final review
+**Status:** Approved design; implementation plan prepared
 
 ## 1. Purpose
 
@@ -330,15 +330,34 @@ Requirements for the upstream change:
 - existing middleware retains current behaviour by default;
 - fail-closed mode is opt-in per middleware registration;
 - if fail-closed middleware fails before a successful downstream handoff, provider execution is aborted;
-- tests prove the provider callback is never reached on fail-closed middleware failure;
+- if fail-closed middleware raises after a successful downstream call, Hermes propagates that privacy failure instead of returning the un-restored downstream result;
+- tests prove the provider callback is never reached on pre-call fail-closed middleware failure;
 - tests prove legacy fail-open behaviour remains unchanged;
 - the behaviour is documented upstream.
 
-This upstream task is tracked in repository Issue #1: **Upstream Hermes: add fail-closed LLM execution middleware**.
+### 11.2 Synchronous live-stream transform
+
+Current Hermes consumes provider streams inside its own streaming helpers before `llm_execution` returns. Its existing `on_stream_delta` plugin hook is asynchronous/observational and therefore too late for a mandatory privacy transform.
+
+The upstream work must also add one narrow synchronous transform middleware for text that is about to enter Hermes' live display/TTS/interim surfaces, conceptually:
+
+```python
+ctx.register_middleware(
+    "llm_stream_text",
+    restore_stream_text,
+    failure_mode="closed",
+)
+```
+
+The transform receives the normalised text plus additive context including `kind` (`text`, `reasoning`, or `interim`), `provider`, `model`, `session_id`, `turn_id`, and `api_request_id`. It runs synchronously before the corresponding text is displayed, recorded as streamed assistant text, sent to TTS, or emitted as completed commentary. A fail-closed exception stops that delivery path.
+
+Tool-call argument fragments do not need to be exposed through this live text middleware. Hermes may continue accumulating them internally. The completed response object is restored through `llm_execution` before Hermes parses or dispatches the tool call, which is the authoritative tool-argument restoration boundary.
+
+This upstream task is tracked in repository Issue #1 and the implementation plan must update the issue/PR scope to cover both fail-closed execution middleware and the synchronous stream-text transform.
 
 No permanent Hermes fork is permitted.
 
-### 11.2 Older Hermes versions
+### 11.3 Older Hermes versions
 
 Compatibility behaviour is configurable.
 
@@ -370,12 +389,12 @@ For a protected provider:
 4. The sidecar stores the reversible mapping internally.
 5. Only the pseudonymised provider payload returns to Python.
 6. Hermes invokes its configured provider normally.
-7. The provider response stream is intercepted.
-8. Provider chunks are fed into the sidecar streaming restoration channel.
-9. Restored chunks are yielded to Hermes.
-10. Hermes parses assistant content/tool calls from restored content.
-11. Gaze session state is updated and persisted as needed.
-12. Sanitised debugging/metrics events are recorded.
+7. As Hermes consumes the provider stream, live text/reasoning/commentary deltas pass through the synchronous `llm_stream_text` privacy transform before display/TTS/interim delivery.
+8. That transform feeds each lane into the sidecar WebSocket restoration state machine and returns only safe restored text.
+9. Hermes continues its normal internal stream accumulation.
+10. When provider execution completes, `llm_execution` restores the completed response object, including tool-call argument strings and any final text not covered by live display restoration.
+11. Hermes parses assistant content and tool calls from that restored completed response.
+12. Gaze session state is persisted as needed and sanitised debugging/metrics events are recorded.
 
 The reversible mapping must never be returned to the Python plugin in normal operation.
 
@@ -448,9 +467,11 @@ The response must not include the reversible mapping.
 
 Streaming restoration is required in v1.
 
-The plugin uses an authenticated WebSocket connection to the sidecar for each protected provider stream.
+The plugin uses an authenticated WebSocket connection to the sidecar for each protected provider request that produces live text.
 
-Provider-native stream objects are adapted by the Python plugin into canonical string-bearing deltas plus non-sensitive metadata. Only transformable textual deltas pass through the sidecar restoration state machine; the plugin then reconstructs the provider-native stream object before yielding it back to Hermes. Unknown or opaque stream fields are not assumed safe.
+Hermes itself continues to own and consume the provider-native stream. The new synchronous `llm_stream_text` middleware hands the plugin only normalised string-bearing live deltas plus non-sensitive request context. The plugin sends those textual lanes through the sidecar restoration state machine and returns restored text synchronously to Hermes. It does not reconstruct or proxy the provider-native stream object.
+
+The request's completed response object is restored separately through `llm_execution`, including tool-call arguments. Unknown or opaque outbound request carriers remain blocked under the structured-payload rules rather than being assumed safe.
 
 Conceptual endpoint:
 
@@ -1009,13 +1030,14 @@ Implementation must preserve these architectural constraints:
 
 ## 31. Upstream Dependency
 
-Repository Issue #1 tracks the upstream Hermes middleware change required for a strong fail-closed guarantee:
+Repository Issue #1 tracks the two small upstream Hermes capabilities required for a strong guarantee:
 
-**Upstream Hermes: add fail-closed LLM execution middleware**
+1. opt-in fail-closed execution middleware registration;
+2. synchronous fail-closed `llm_stream_text` transformation before live text/reasoning/commentary delivery, with `api_request_id` in context.
 
-The implementation plan must treat this as a concrete workstream, including an upstream Hermes PR and integration tests in this repository.
+The implementation plan treats this as a concrete workstream, including an upstream Hermes PR and integration tests in this repository. Existing middleware and stream-observer behavior remains backward compatible unless a plugin explicitly requests the new fail-closed transform.
 
-The project may implement compatibility mode before the upstream change is merged, but mandatory external-provider protection must default to blocked until Hermes exposes the required fail-closed capability.
+The project may implement compatibility mode before the upstream change is merged, but mandatory external-provider protection defaults to blocked until Hermes exposes both required capabilities.
 
 ## 32. Acceptance Summary
 
