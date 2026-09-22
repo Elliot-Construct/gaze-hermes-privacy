@@ -19,6 +19,7 @@ class FakeSidecarClient:
     def __init__(self):
         self.clean_calls = 0
         self.restore_calls = 0
+        self.open_stream_calls = 0
         self.last_clean_namespace = None
         self.last_clean_fields = None
 
@@ -46,6 +47,15 @@ class FakeSidecarClient:
 
     async def status(self):
         return SidecarStatus(protocol_version=1, gaze_version="0.14.0")
+
+    async def open_stream(self, namespace):
+        self.open_stream_calls += 1
+        from gaze_privacy.sidecar_client import StreamClient
+        # Return a mock stream client
+        mock_stream = MagicMock()
+        mock_stream.feed = AsyncMock(return_value="restored")
+        mock_stream.feed_sync = MagicMock(return_value="restored")
+        return mock_stream
 
 
 class FakeSidecarManager:

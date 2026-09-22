@@ -10,7 +10,7 @@ services:
       - GAZE_SIDECAR_API_TOKEN_FILE=/secrets/api-token
       - GAZE_SIDECAR_MASTER_KEY_FILE=/secrets/snapshot-key
       - GAZE_SIDECAR_DATA_DIR=/data
-      - GAZE_SIDECAR_BIND=127.0.0.1:65113
+      - GAZE_SIDECAR_BIND=0.0.0.0:65113
     volumes:
       - ../gaze_privacy/secrets/api-token:/secrets/api-token:ro
       - ../gaze_privacy/secrets/snapshot-key:/secrets/snapshot-key:ro

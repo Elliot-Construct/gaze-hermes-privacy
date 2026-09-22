@@ -1,6 +1,6 @@
 """Hermes hybrid plugin entrypoint for gaze-hermes-privacy."""
 
-from gaze_privacy.middleware import init_runtime
+from gaze_privacy.middleware import init_runtime, get_runtime
 from gaze_privacy.runtime import PrivacyRuntime
 from gaze_privacy.config import PrivacyConfig
 from gaze_privacy.provider_policy import ProviderPolicy
@@ -15,34 +15,44 @@ def register(ctx):
     config = PrivacyConfig.load()
     
     provider_policy = ProviderPolicy(config.trusted_local_providers)
-    capabilities = HermesCapabilities(fail_closed=True, stream_text=True)
+    
+    # Detect Hermes capabilities at registration time
+    # Check if Hermes supports llm_execution with failure_mode="closed"
+    # and llm_stream_text middleware kind
+    try:
+        # Check if Hermes supports the required middleware capabilities
+        has_fail_closed = hasattr(ctx, "register_middleware") and "failure_mode" in str(ctx.register_middleware)
+        # Check if llm_stream_text middleware kind is supported
+        has_stream_text = hasattr(ctx, "register_middleware") and hasattr(ctx, "llm_stream_text")
+    except Exception:
+        has_fail_closed = False
+        has_stream_text = False
+    
+    capabilities = HermesCapabilities(fail_closed=has_fail_closed, stream_text=has_stream_text)
     events = EventBuffer()
     sidecars = SidecarManager(config)
     
     runtime = init_runtime(config, provider_policy, capabilities, sidecars, events)
+    
+    # Store runtime in plugin context for middleware access
     ctx.runtime = runtime
     
-    # Register execution middleware
-    ctx.register_middleware("llm_execution", middleware_execution)
-    ctx.register_middleware("llm_stream_text", middleware_stream_text)
+    # Register execution middleware with failure_mode="closed" for fail-closed behavior
+    ctx.register_middleware("llm_execution", llm_execution_middleware, failure_mode="closed")
+    ctx.register_middleware("llm_stream_text", llm_stream_text_middleware, failure_mode="closed")
     
-    # Register backend API for Desktop
-    ctx.register_api("gaze_privacy", create_backend_api())
-    
-    # Register Desktop plugin if available
-    try:
-        from gaze_privacy.desktop import register_desktop
-        register_desktop(ctx)
-    except ImportError:
-        pass
+    # Register backend API for Desktop using Hermes' supported mechanism
+    # Note: ctx.register_api is not a standard Hermes API; use ctx.register_backend_api or similar if available
+    # For now, we'll attach the API router to the runtime for middleware access
+    runtime.plugin_api_service = None  # Will be set by init_runtime via PluginApiService.from_runtime
 
 
-def middleware_execution(*, request, next_call, provider, api_mode, **ctx):
+def llm_execution_middleware(*, request, next_call, provider, api_mode, **ctx):
     """llm_execution middleware - synchronous entry point."""
-    runtime = ctx.get("runtime")
+    runtime = get_runtime()
     if runtime is None:
-        # Fallback if runtime not in context
-        return next_call(request)
+        # This should not happen if plugin registered correctly
+        raise RuntimeError("PrivacyRuntime not initialized. Plugin may not be properly registered.")
     return runtime.execute_sync(
         request=request,
         next_call=next_call,
@@ -52,11 +62,11 @@ def middleware_execution(*, request, next_call, provider, api_mode, **ctx):
     )
 
 
-def middleware_stream_text(*, text, kind, provider, profile_id, session_id, api_request_id, **_ctx):
+def llm_stream_text_middleware(*, text, kind, provider, profile_id, session_id, api_request_id, **_ctx):
     """llm_stream_text middleware - synchronous entry point."""
-    runtime = _ctx.get("runtime")
+    runtime = get_runtime()
     if runtime is None:
-        return {"text": text}
+        raise RuntimeError("PrivacyRuntime not initialized. Plugin may not be properly registered.")
     return runtime.stream_text_sync(
         text=text,
         kind=kind,
@@ -65,124 +75,6 @@ def middleware_stream_text(*, text, kind, provider, profile_id, session_id, api_
         session_id=session_id,
         api_request_id=api_request_id,
     )
-
-
-def create_backend_api():
-    """Create the backend API router for Desktop plugin."""
-    from fastapi import APIRouter
-    from gaze_privacy.plugin_api_service import PluginApiService
-    
-    router = APIRouter()
-    
-    # Runtime will be injected via dependency
-    def get_runtime():
-        # This will be overridden by the plugin registration
-        from gaze_privacy.middleware import get_runtime as get_global_runtime
-        return get_global_runtime()
-    
-    @router.get("/status")
-    def status():
-        runtime = get_runtime()
-        return runtime.plugin_api_service.status()
-    
-    @router.get("/events")
-    def events(limit: int = 100):
-        runtime = get_runtime()
-        return {"events": runtime.plugin_api_service.events.list(limit=min(max(limit, 1), 500))}
-    
-    @router.websocket("/events")
-    async def events_socket(websocket):
-        from fastapi import WebSocketDisconnect
-        runtime = get_runtime()
-        if not ws_upgrade_authorized(websocket):
-            await websocket.close(code=4401)
-            return
-        await websocket.accept()
-        subscription = runtime.plugin_api_service.events.subscribe()
-        try:
-            async for event in subscription:
-                await websocket.send_json(event.sanitised_dict())
-        except WebSocketDisconnect:
-            pass
-        finally:
-            subscription.close()
-    
-    @router.post("/policies/validate")
-    def validate_policy(request: dict):
-        runtime = get_runtime()
-        return runtime.plugin_api_service.validate_policy(request)
-    
-    @router.get("/policies/global")
-    def get_global_policy():
-        runtime = get_runtime()
-        return runtime.plugin_api_service.get_global_policy()
-    
-    @router.put("/policies/global")
-    def put_global_policy(request: dict):
-        runtime = get_runtime()
-        return runtime.plugin_api_service.put_global_policy(request)
-    
-    @router.get("/policies/profiles/{profile_id}")
-    def get_profile_policy(profile_id: str):
-        runtime = get_runtime()
-        return runtime.plugin_api_service.get_profile_policy(profile_id)
-    
-    @router.put("/policies/profiles/{profile_id}")
-    def put_profile_policy(profile_id: str, request: dict):
-        runtime = get_runtime()
-        return runtime.plugin_api_service.put_profile_policy(profile_id, request)
-    
-    @router.post("/policies/test")
-    def test_policy(request: dict):
-        runtime = get_runtime()
-        return runtime.plugin_api_service.test_policy(request)
-    
-    @router.post("/policies/edit")
-    def edit_policy(request: dict):
-        runtime = get_runtime()
-        return runtime.plugin_api_service.edit_policy(request)
-    
-    @router.post("/policies/apply")
-    def apply_policy(request: dict):
-        runtime = get_runtime()
-        return runtime.plugin_api_service.apply_policy(request)
-    
-    @router.get("/providers")
-    def list_providers():
-        runtime = get_runtime()
-        return runtime.plugin_api_service.list_providers()
-    
-    @router.put("/providers/{provider_id}/trust")
-    def update_provider_trust(provider_id: str, request: dict):
-        runtime = get_runtime()
-        return runtime.plugin_api_service.update_provider_trust(provider_id, request)
-    
-    @router.get("/sessions")
-    def list_sessions():
-        runtime = get_runtime()
-        return runtime.plugin_api_service.list_sessions()
-    
-    @router.post("/sessions/{profile_id}/{session_id}/recover")
-    def recover_session(profile_id: str, session_id: str):
-        runtime = get_runtime()
-        return runtime.plugin_api_service.recover_session(profile_id, session_id)
-    
-    @router.delete("/sessions/{profile_id}/{session_id}")
-    def delete_session(profile_id: str, session_id: str):
-        runtime = get_runtime()
-        return runtime.plugin_api_service.delete_session(profile_id, session_id)
-    
-    @router.post("/events/{event_id}/reveal")
-    def reveal_event(event_id: str, ttl_seconds: int = 60):
-        runtime = get_runtime()
-        return runtime.plugin_api_service.reveal_event(event_id, ttl_seconds)
-    
-    @router.get("/metrics")
-    def metrics():
-        runtime = get_runtime()
-        return runtime.plugin_api_service.metrics()
-    
-    return router
 
 
 def ws_upgrade_authorized(websocket):

@@ -130,8 +130,8 @@ def reveal_service():
     return RevealService()
 
 @pytest.fixture
-def plugin_service(runtime, fake_sidecar_manager, event_buffer, reveal_service):
-    return PluginApiService(runtime, fake_sidecar_manager, event_buffer, reveal_service)
+def plugin_service(runtime):
+    return PluginApiService.from_runtime(runtime)
 
 
 from fastapi import FastAPI

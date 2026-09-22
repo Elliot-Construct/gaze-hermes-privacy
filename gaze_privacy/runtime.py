@@ -148,7 +148,9 @@ class PrivacyRuntime:
         cleaned = await managed.client.clean(namespace, prepared.fields)
         protected_request = prepared.apply(cleaned["fields"])
 
-        request_key = self.streams.reserve(namespace, client=managed.client)
+        # Open WebSocket stream for live restoration
+        stream_client = await managed.client.open_stream(namespace)
+        request_key = self.streams.reserve(namespace, client=stream_client)
         try:
             response = next_call(protected_request)
             restored = await restore_completed_response(

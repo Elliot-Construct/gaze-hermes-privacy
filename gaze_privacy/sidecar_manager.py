@@ -17,7 +17,7 @@ from typing import Any
 
 from gaze_privacy.config import PrivacyConfig
 from gaze_privacy.sidecar_client import SidecarClient, SidecarStatus
-from gaze_privacy.secrets import ensure_secret
+from gaze_privacy.secrets import ensure_secret, ensure_secret_bytes
 
 
 SIDECAR_PROTOCOL_VERSION = 1
@@ -51,8 +51,8 @@ class SidecarManager:
     def _api_token(self) -> str:
         return ensure_secret(self.config.api_token_file).strip()
 
-    def _master_key(self) -> str:
-        return ensure_secret(self.config.master_key_file).strip()
+    def _master_key(self) -> bytes:
+        return ensure_secret_bytes(self.config.master_key_file)
 
     def _sidecar_binary(self) -> Path:
         # In native mode, the binary is expected at a known location
@@ -115,10 +115,14 @@ class SidecarManager:
         run_dir.mkdir(parents=True, exist_ok=True)
         ready_file = run_dir / "ready.json"
 
+        # Profile-specific data directory for snapshot isolation
+        profile_data_dir = self.config.home / "data" / profile_id
+        profile_data_dir.mkdir(parents=True, exist_ok=True)
+
         env = os.environ.copy()
         env["GAZE_SIDECAR_API_TOKEN_FILE"] = str(self.config.api_token_file)
         env["GAZE_SIDECAR_MASTER_KEY_FILE"] = str(self.config.master_key_file)
-        env["GAZE_SIDECAR_DATA_DIR"] = str(self.config.home / "data")
+        env["GAZE_SIDECAR_DATA_DIR"] = str(profile_data_dir)
         env["GAZE_SIDECAR_BIND"] = "127.0.0.1:0"
         env["GAZE_SIDECAR_READY_FILE"] = str(ready_file)
 

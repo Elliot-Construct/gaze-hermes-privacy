@@ -68,7 +68,7 @@ def llm_stream_text_middleware(
     profile_id: str,
     session_id: str,
     api_request_id: str,
-    **_ctx: Any,
+    **context: Any,
 ) -> dict[str, str]:
     """llm_stream_text middleware callback for Hermes (synchronous)."""
     runtime = get_runtime()
@@ -76,7 +76,7 @@ def llm_stream_text_middleware(
     if runtime.provider_policy.classify(provider) is ProtectionDecision.BYPASS:
         return {"text": text}
 
-    runtime.require_or_mark_capabilities(provider=provider, context=_ctx)
+    runtime.require_or_mark_capabilities(provider=provider, context=context)
 
     key = (
         str(profile_id or "default"),
