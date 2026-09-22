@@ -1,0 +1,14 @@
+[project]
+name = "gaze-hermes-privacy"
+version = "0.1.0"
+description = "Reversible PII protection for Hermes external LLM calls via a local Gaze sidecar"
+requires-python = ">=3.11"
+readme = "README.md"
+license = { text = "MIT" }
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+pythonpath = ["."]
