@@ -349,7 +349,7 @@ ctx.register_middleware(
 )
 ```
 
-The transform receives the normalised text plus additive context including `kind` (`text`, `reasoning`, or `interim`), `provider`, `model`, `session_id`, `turn_id`, and `api_request_id`. It runs synchronously before the corresponding text is displayed, recorded as streamed assistant text, sent to TTS, or emitted as completed commentary. A fail-closed exception stops that delivery path.
+The transform receives the normalised text plus additive context including `kind` (`text`, `reasoning`, or `interim`), `provider`, `model`, `profile_id`, `session_id`, `turn_id`, and `api_request_id`. It runs synchronously before the corresponding text is displayed, recorded as streamed assistant text, sent to TTS, or emitted as completed commentary. A fail-closed exception stops that delivery path.
 
 Tool-call argument fragments do not need to be exposed through this live text middleware. Hermes may continue accumulating them internally. The completed response object is restored through `llm_execution` before Hermes parses or dispatches the tool call, which is the authoritative tool-argument restoration boundary.
 
