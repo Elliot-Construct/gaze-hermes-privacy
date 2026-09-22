@@ -425,18 +425,24 @@ POST   /v1/restore
 
 POST   /v1/policies/validate
 POST   /v1/policies/test
-POST   /v1/policies/reload
+POST   /v1/policies/edit
+POST   /v1/policies/apply
 GET    /v1/policies/effective
 
 GET    /v1/sessions
-GET    /v1/sessions/{id}
-DELETE /v1/sessions/{id}
+GET    /v1/sessions/{profile_id}/{session_id}
+POST   /v1/sessions/{profile_id}/{session_id}/recover
+DELETE /v1/sessions/{profile_id}/{session_id}
 
 GET    /v1/status
 GET    /v1/metrics
 ```
 
 Every privacy operation carries explicit namespace fields rather than relying on process-global state.
+
+Policy `edit` returns a candidate document only. Policy `apply` uses an expected policy hash for optimistic concurrency, validates/builds the candidate before activation, and atomically replaces the canonical TOML only after validation succeeds. Policy `test` uses a temporary session and never contacts an LLM provider.
+
+Session list/status/recovery routes expose metadata only. They must never export token-to-raw mappings.
 
 Example request:
 
