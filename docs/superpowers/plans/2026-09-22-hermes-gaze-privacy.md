@@ -58,7 +58,7 @@
 - Create: `docs/upstream-hermes.md`
 
 **Interfaces:**
-- Consumes: current Hermes `PluginContext.register_middleware(kind, callback)`, `run_llm_execution_middleware(...)`, and stream delivery methods.
+- Consumes: current Hermes `PluginContext.register_middleware(kind: str, callback: Callable)`, `run_llm_execution_middleware(request: Dict[str, Any], next_call: Callable[[Dict[str, Any]], Any], **context: Any) -> Any`, and stream delivery methods.
 - Produces: `PluginContext.register_middleware(kind, callback, *, failure_mode="open")` with `failure_mode in {"open","closed"}`; new middleware kind `llm_stream_text`; `apply_llm_stream_text_middleware(text: str, *, kind: str, **context) -> str`; additive `api_request_id` in stream context.
 
 - [ ] **Step 1: Write failing fail-closed execution tests**
@@ -195,7 +195,43 @@ def test_stream_text_closed_failure_reaches_stream_caller(monkeypatch):
         agent._fire_stream_delta("<Name")
 ```
 
-Add equivalent coverage for reasoning and interim commentary.
+Add explicit reasoning and commentary tests so those lanes cannot bypass the synchronous transform:
+
+```python
+def test_reasoning_stream_text_middleware_transforms_before_reasoning_callback(monkeypatch):
+    agent = _agent()
+    delivered = []
+    agent.reasoning_callback = delivered.append
+
+    monkeypatch.setattr(
+        "hermes_cli.middleware.apply_llm_stream_text_middleware",
+        lambda text, *, kind, **_ctx: "Jane" if kind == "reasoning" else text,
+    )
+
+    agent._fire_reasoning_delta("<Name_1>")
+
+    assert delivered == ["Jane"]
+
+
+def test_codex_commentary_is_transformed_before_interim_delivery(monkeypatch):
+    agent = _agent()
+    delivered = []
+    agent.interim_assistant_callback = (
+        lambda text, *, already_streamed=False:
+        delivered.append((text, already_streamed))
+    )
+
+    monkeypatch.setattr(
+        "hermes_cli.middleware.apply_llm_stream_text_middleware",
+        lambda text, *, kind, **_ctx: "Jane" if kind == "interim" else text,
+    )
+
+    agent._fire_streamed_codex_commentary("<Name_1>")
+
+    assert delivered == [("Jane", False)]
+```
+
+Keep the existing closed-failure test on the text lane and add one parameterised test that raises from the transform for `kind in {"reasoning", "interim"}`, asserting neither callback receives untransformed text.
 
 - [ ] **Step 6: Implement `llm_stream_text`**
 
@@ -1454,7 +1490,7 @@ git commit -m "feat: expose safe Hermes Desktop privacy API"
 **Files:**
 - Create: `desktop/plugin.js`
 - Create: `tests/desktop/plugin.test.mjs`
-- Modify: `pyproject.toml` or root test scripts only if needed to invoke the Desktop test harness
+- Create: `package.json`
 
 **Interfaces:**
 - Consumes: `ctx.rest`, `ctx.socket`, `host.state.focusedSessionProfile`, backend API from Task 11.
@@ -1462,11 +1498,24 @@ git commit -m "feat: expose safe Hermes Desktop privacy API"
 
 - [ ] **Step 1: Write static/runtime contract tests**
 
-The Desktop plugin is uncompiled ESM. Tests should assert:
+The Desktop plugin is uncompiled ESM. Create a dependency-free Node test using `node:test` + `node:assert/strict` + `fs/promises`. It must assert:
 - no JSX syntax;
-- imports only from `@hermes/plugin-sdk`, `react`, `react/jsx-runtime`;
-- route and sidebar contributions use the same path;
-- no direct `65113` URL or bearer secret reference exists.
+- every bare import specifier is one of `@hermes/plugin-sdk`, `react`, `react/jsx-runtime`;
+- route and sidebar contributions use the same `/gaze-privacy` path;
+- no direct `65113`, `Authorization`, API-token-file, or master-key reference exists;
+- the source imports exactly the SDK tab primitives `Tabs`, `TabsList`, and `TabsTrigger`.
+
+Create `package.json` as:
+
+```json
+{
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:desktop": "node --test tests/desktop/*.test.mjs"
+  }
+}
+```
 
 - [ ] **Step 2: Implement plugin registration**
 
@@ -1480,6 +1529,8 @@ import {
   Codicon,
   StatusDot,
   Tabs,
+  TabsList,
+  TabsTrigger,
   useQuery,
   useValue,
   host
@@ -1516,7 +1567,7 @@ export default {
 }
 ```
 
-Use actual SDK component names verified against the current Desktop SDK when implementing; if `Tabs` is exposed as `TabsRoot/TabsList/TabsTrigger/TabsContent`, import those exact exports rather than inventing an alias.
+The current Hermes Desktop SDK exports `Tabs`, `TabsList`, and `TabsTrigger`; it does not export `TabsContent`. Keep the active tab in component-local `useState`, render triggers inside `TabsList`, and conditionally render the corresponding panel body below the list. Do not import private Radix primitives or app-internal modules.
 
 - [ ] **Step 3: Implement Overview**
 
@@ -1546,14 +1597,19 @@ Clicking the status item navigates to `/gaze-privacy`.
 
 - [ ] **Step 6: Run Desktop tests**
 
-Run the repo's chosen Node test command plus Hermes Desktop plugin load check against the current SDK.
+Run:
 
-Expected: plugin parses as ESM, registers contributions, and never references the sidecar directly.
+```bash
+node --check desktop/plugin.js
+npm run test:desktop
+```
+
+Expected: both commands exit 0; the static contract suite confirms the plugin uses the public SDK surface, shares one route path, and never references the sidecar endpoint or secrets directly.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add desktop tests/desktop
+git add desktop tests/desktop package.json
 git commit -m "feat: add Hermes Desktop privacy workspace"
 ```
 
@@ -1585,14 +1641,14 @@ Two modes:
 - Visual;
 - Advanced TOML.
 
-Visual editor fields:
-- name;
-- enabled;
-- detector kind;
-- pattern/dictionary;
-- class;
-- action;
-- priority/scope where supported.
+The visual editor exposes only fields that map losslessly to Gaze 0.14 policy TOML:
+- custom recogniser `name`, `kind`, `pattern`, `class`;
+- dictionary source: inline `terms`, `terms_file`, or `terms_from_context`;
+- `case_sensitive` and `token_family`;
+- class/column rule identity plus `action`;
+- active locales and NER threshold/model path.
+
+Do not invent Gaze policy keys such as recogniser `enabled`, `priority`, `scope`, or `description`. Profile inheritance/removal is represented by the plugin's overlay schema from Task 4, and any valid construct not represented by the visual editor remains Advanced-only and byte-preserved.
 
 Apply flow is `edit -> validate -> semantic diff -> apply`. Never save invalid policy over the active version.
 
@@ -1641,6 +1697,7 @@ git commit -m "feat: add privacy policy and session controls"
 - Create: `.github/workflows/test.yml`
 - Create: `.github/workflows/release.yml`
 - Create: `scripts/update-sidecar-manifest.py`
+- Create: `scripts/docker-smoke.sh`
 - Modify: `sidecar-release.json`
 - Create: `tests/python/test_release_manifest.py`
 
@@ -1674,15 +1731,28 @@ At minimum:
 
 Build supported native targets, produce SHA-256 values, attach binaries, publish Docker image, and generate/update `sidecar-release.json`. Never publish a manifest entry for a binary that did not build and test.
 
-- [ ] **Step 5: Run manifest and local build tests**
+- [ ] **Step 5: Add and run the Docker health/auth smoke test**
+
+`scripts/docker-smoke.sh` must create a temporary synthetic API token, 32-byte snapshot key, and a minimal no-NER Gaze test policy, start the Compose service, then assert:
+
+```bash
+curl --fail http://127.0.0.1:65113/healthz
+curl --fail-with-body http://127.0.0.1:65113/v1/status && exit 1 || test "$?" -eq 22
+curl --fail -H "Authorization: Bearer $GAZE_TEST_TOKEN" http://127.0.0.1:65113/v1/status
+```
+
+The script must trap cleanup and run `docker compose down -v` on exit. The unauthenticated `/v1/status` request must return HTTP 401; `/healthz` stays minimal and unauthenticated.
+
+Run:
 
 ```bash
 pytest tests/python/test_release_manifest.py -v
 cargo test --manifest-path sidecar/Cargo.toml
 docker compose config
+bash scripts/docker-smoke.sh
 ```
 
-Expected: PASS.
+Expected: all commands exit 0.
 
 - [ ] **Step 6: Commit**
 
@@ -1792,7 +1862,14 @@ cargo clippy --manifest-path sidecar/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path sidecar/Cargo.toml
 ```
 
-Run Desktop tests and the Docker health/auth smoke test as defined by Task 14.
+Then run:
+
+```bash
+node --check desktop/plugin.js
+npm run test:desktop
+docker compose config
+bash scripts/docker-smoke.sh
+```
 
 Expected: every suite passes, no PII/log leak assertion fires, and the fake external provider never receives original protected values.
 
