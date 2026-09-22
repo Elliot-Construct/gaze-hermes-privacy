@@ -65,7 +65,6 @@ def llm_stream_text_middleware(
     text: str,
     kind: str,
     provider: str,
-    profile_id: str,
     session_id: str,
     api_request_id: str,
     **context: Any,
@@ -79,7 +78,6 @@ def llm_stream_text_middleware(
     runtime.require_or_mark_capabilities(provider=provider, context=context)
 
     key = (
-        str(profile_id or "default"),
         str(session_id or ""),
         str(api_request_id or ""),
     )

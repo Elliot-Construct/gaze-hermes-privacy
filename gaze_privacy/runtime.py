@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from gaze_privacy.events import EventBuffer, PrivacyEvent, create_event
 from gaze_privacy.sidecar_client import SidecarClient, StreamClient
@@ -21,54 +23,107 @@ class HermesCapabilities:
     stream_text: bool
 
 
+@dataclass
+class StreamReservation:
+    profile_id: str
+    namespace: dict[str, str]
+    stream: StreamClient
+
+
 class StreamRegistry:
     """Thread-safe registry for streaming restoration clients."""
 
     def __init__(self):
-        self._streams: dict[tuple[str, str, str], StreamClient] = {}
-        self._lock = __import__("threading").Lock()
+        self._streams: dict[tuple[str, str], StreamReservation] = {}
+        self._lock = threading.Lock()
 
-    def reserve(self, namespace: dict[str, str], client: StreamClient) -> tuple[str, str, str]:
+    def reserve(self, namespace: dict[str, str], client: StreamClient) -> tuple[str, str]:
         key = (
-            str(namespace.get("profile_id", "default")),
             str(namespace.get("session_id", "")),
             str(namespace.get("request_id", "")),
         )
         with self._lock:
             if key not in self._streams:
-                self._streams[key] = client
+                self._streams[key] = StreamReservation(
+                    profile_id=namespace.get("profile_id", "default"),
+                    namespace=namespace,
+                    stream=client,
+                )
         return key
 
-    def get_or_open(self, key: tuple[str, str, str]) -> StreamClient:
+    def get_or_open(self, key: tuple[str, str]) -> StreamClient:
         with self._lock:
             if key not in self._streams:
                 raise KeyError(f"Stream key not found: {key}")
-            return self._streams[key]
+            return self._streams[key].stream
 
-    def finish_if_open(self, key: tuple[str, str, str]) -> None:
+    def finish(self, key: tuple[str, str], bridge) -> None:
         with self._lock:
-            if key in self._streams:
-                # Stream will be cleaned up on release
-                pass
+            reservation = self._streams.get(key)
+        if reservation is None:
+            return
+        # Create a coroutine that calls the stream's finish method
+        async def _finish_wrapper():
+            result = reservation.stream.finish()
+            if asyncio.iscoroutine(result):
+                return await result
+            return result
+        coro = _finish_wrapper()
+        tail = bridge.call(coro)
+        if tail:
+            raise PrivacyBlockedError("stream finished with unexpected buffered output")
 
-    def abort_if_open(self, key: tuple[str, str, str]) -> None:
+    def abort(self, key: tuple[str, str], bridge) -> None:
         with self._lock:
-            if key in self._streams:
-                client = self._streams[key]
-                if hasattr(client, "abort"):
-                    import asyncio
-                    try:
-                        loop = asyncio.get_event_loop()
-                        if loop.is_running():
-                            loop.create_task(client.abort())
-                        else:
-                            loop.run_until_complete(client.abort())
-                    except Exception:
-                        pass
+            reservation = self._streams.get(key)
+        if reservation is not None:
+            async def _abort_wrapper():
+                result = reservation.stream.abort()
+                if asyncio.iscoroutine(result):
+                    return await result
+                return result
+            coro = _abort_wrapper()
+            bridge.call(coro)
 
-    def release(self, key: tuple[str, str, str]) -> None:
+    def release(self, key: tuple[str, str]) -> None:
         with self._lock:
             self._streams.pop(key, None)
+
+
+class AsyncBridge:
+    """Dedicated asyncio event loop running in a background thread."""
+
+    def __init__(self):
+        self._loop = asyncio.new_event_loop()
+        self._ready = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="gaze-privacy-async",
+            daemon=True,
+        )
+        self._thread.start()
+        self._ready.wait(timeout=5.0)
+
+    def _run(self):
+        asyncio.set_event_loop(self._loop)
+        self._ready.set()
+        self._loop.run_forever()
+
+    def call(self, coro, *, timeout=30.0):
+        if threading.current_thread() is self._thread:
+            raise RuntimeError("AsyncBridge.call() invoked from its own event-loop thread")
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result(timeout=timeout)
+
+    def close(self):
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=5.0)
+
+
+@dataclass(frozen=True)
+class HermesCapabilities:
+    fail_closed: bool
+    stream_text: bool
 
 
 class PrivacyRuntime:
@@ -78,9 +133,9 @@ class PrivacyRuntime:
         self,
         config,
         provider_policy,
-        capabilities: HermesCapabilities,
+        capabilities,
         sidecars,
-        events: EventBuffer,
+        events,
     ):
         self.config = config
         self.provider_policy = provider_policy
@@ -88,7 +143,16 @@ class PrivacyRuntime:
         self.sidecars = sidecars
         self.events = events
         self.streams = StreamRegistry()
+        self.bridge = AsyncBridge()
         self.plugin_api_service = None  # Set by init_runtime
+
+    def resolve_profile_id(self) -> str:
+        """Resolve the actual Hermes profile name."""
+        try:
+            from hermes_constants import get_hermes_home, profile_name_for_home
+            return profile_name_for_home(get_hermes_home()) or "default"
+        except Exception:
+            return "default"
 
     def require_or_mark_capabilities(self, *, provider: str, context: dict) -> None:
         if self.capabilities.fail_closed and self.capabilities.stream_text:
@@ -135,7 +199,7 @@ class PrivacyRuntime:
 
         self.require_or_mark_capabilities(provider=provider, context=context)
 
-        profile_id = context.get("profile_id") or context.get("turn_id") or "default"
+        profile_id = self.resolve_profile_id()
         managed = await self.sidecars.ensure_running(profile_id)
 
         namespace = {
@@ -148,7 +212,6 @@ class PrivacyRuntime:
         cleaned = await managed.client.clean(namespace, prepared.fields)
         protected_request = prepared.apply(cleaned["fields"])
 
-        # Open WebSocket stream for live restoration
         stream_client = await managed.client.open_stream(namespace)
         request_key = self.streams.reserve(namespace, client=stream_client)
         try:
@@ -159,10 +222,10 @@ class PrivacyRuntime:
                 api_mode,
                 response,
             )
-            self.streams.finish_if_open(request_key)
+            self.streams.finish(request_key, self.bridge)
             return restored
         except Exception:
-            self.streams.abort_if_open(request_key)
+            self.streams.abort(request_key, self.bridge)
             raise
         finally:
             self.streams.release(request_key)
@@ -177,8 +240,7 @@ class PrivacyRuntime:
         **context: Any,
     ) -> Any:
         """Synchronous execution for Hermes middleware."""
-        import asyncio
-        return asyncio.run(self.execute(
+        return self.bridge.call(self.execute(
             request=request,
             next_call=next_call,
             provider=provider,
@@ -192,7 +254,6 @@ class PrivacyRuntime:
         text: str,
         kind: str,
         provider: str,
-        profile_id: str,
         session_id: str,
         api_request_id: str,
         **_ctx: Any,
@@ -206,7 +267,6 @@ class PrivacyRuntime:
         self.require_or_mark_capabilities(provider=provider, context=_ctx)
 
         key = (
-            str(profile_id or "default"),
             str(session_id or ""),
             str(api_request_id or ""),
         )
@@ -220,21 +280,15 @@ class PrivacyRuntime:
         text: str,
         kind: str,
         provider: str,
-        profile_id: str,
         session_id: str,
         api_request_id: str,
         **_ctx: Any,
     ) -> dict[str, str]:
         """Synchronous streaming text restoration for Hermes middleware."""
-        import asyncio
-        return asyncio.run(self.stream_text(
-            text=text,
-            kind=kind,
-            provider=provider,
-            profile_id=profile_id,
-            session_id=session_id,
-            api_request_id=api_request_id,
-        ))
+        key = (str(session_id or ""), str(api_request_id or ""))
+        stream = self.streams.get_or_open(key)
+        restored = self.bridge.call(stream.feed(kind=kind, text=text))
+        return {"text": restored}
 
 
 def llm_execution_middleware(**kwargs):

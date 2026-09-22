@@ -31,6 +31,10 @@ pub struct Config {
     /// Path to the snapshot master key file. If not provided, a key is generated/stored in the data directory.
     #[arg(long, env = "GAZE_SIDECAR_MASTER_KEY_FILE")]
     pub master_key_file: Option<PathBuf>,
+
+    /// Allow binding to non-loopback addresses (required for Docker).
+    #[arg(long, env = "GAZE_SIDECAR_ALLOW_NON_LOOPBACK", default_value_t = false)]
+    pub allow_non_loopback: bool,
 }
 
 impl Config {
@@ -114,7 +118,7 @@ impl Config {
             self.bind.ip(),
             std::net::IpAddr::V6(ip) if ip.is_loopback()
         );
-        if !is_loopback {
+        if !is_loopback && !self.allow_non_loopback {
             return Err(ConfigError::BindNotLoopback(self.bind));
         }
         Ok(())
@@ -130,7 +134,7 @@ pub enum ConfigError {
     },
     #[error("api token file {path} is empty")]
     TokenEmpty { path: PathBuf },
-    #[error("bind address {0} is not loopback")]
+    #[error("bind address {0} is not loopback (use GAZE_SIDECAR_ALLOW_NON_LOOPBACK to override)")]
     BindNotLoopback(SocketAddr),
     #[error("failed to prepare data directory {path}: {source}")]
     DataDir {

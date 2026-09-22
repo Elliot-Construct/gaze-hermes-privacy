@@ -15,9 +15,15 @@ class FakeStreamClient:
         self.open_called = False
 
     async def feed(self, kind: str, text: str):
-        self.feed_calls.append((kind, text))
+        self.feed_calls += 1
         # Return restored text
         return text.replace("<token>", "alice@example.invalid")
+
+    async def finish(self):
+        return ""
+
+    async def abort(self):
+        return ""
 
 
 @pytest.fixture
@@ -34,7 +40,8 @@ def test_stream_registry_reserve_and_get_or_open(stream_registry, fake_stream_cl
     namespace = {"profile_id": "default", "session_id": "s1", "request_id": "r1"}
     key = stream_registry.reserve(namespace, client=fake_stream_client)
 
-    assert key == ("default", "s1", "r1")
+    # Key is now (session_id, request_id)
+    assert key == ("s1", "r1")
 
     stream = stream_registry.get_or_open(key)
     assert stream is fake_stream_client
@@ -42,15 +49,18 @@ def test_stream_registry_reserve_and_get_or_open(stream_registry, fake_stream_cl
 
 def test_stream_registry_get_or_open_unknown_key_raises(stream_registry):
     with pytest.raises(KeyError):
-        stream_registry.get_or_open(("unknown", "s1", "r1"))
+        stream_registry.get_or_open(("unknown", "r1"))
 
 
 def test_stream_registry_finish_and_abort(stream_registry, fake_stream_client):
     namespace = {"profile_id": "default", "session_id": "s1", "request_id": "r1"}
     key = stream_registry.reserve(namespace, client=fake_stream_client)
 
-    stream_registry.finish_if_open(key)
-    stream_registry.abort_if_open(key)
+    # finish() and abort() now require a bridge parameter
+    bridge = MagicMock()
+    bridge.call = MagicMock(return_value="")
+    stream_registry.finish(key, bridge)
+    stream_registry.abort(key, bridge)
 
     # Should not raise
 

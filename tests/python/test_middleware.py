@@ -51,11 +51,19 @@ class FakeSidecarClient:
     async def open_stream(self, namespace):
         self.open_stream_calls += 1
         from gaze_privacy.sidecar_client import StreamClient
-        # Return a mock stream client
-        mock_stream = MagicMock()
-        mock_stream.feed = AsyncMock(return_value="restored")
-        mock_stream.feed_sync = MagicMock(return_value="restored")
-        return mock_stream
+        # Return a mock stream client with proper async methods
+        class MockStream:
+            def __init__(self):
+                self.feed = AsyncMock(return_value="restored")
+                self.feed_sync = MagicMock(return_value="restored")
+            
+            async def finish(self):
+                return ""
+            
+            async def abort(self):
+                return ""
+        
+        return MockStream()
 
 
 class FakeSidecarManager:

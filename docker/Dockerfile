@@ -6,6 +6,7 @@ RUN cargo build --locked --release --manifest-path sidecar/Cargo.toml
 
 FROM debian:bookworm-slim
 RUN useradd --system --uid 10001 --create-home gaze
+RUN mkdir -p /data && chown gaze:gaze /data
 COPY --from=build /src/sidecar/target/release/gaze-hermes-sidecar /usr/local/bin/gaze-hermes-sidecar
 USER 10001:10001
 EXPOSE 65113
