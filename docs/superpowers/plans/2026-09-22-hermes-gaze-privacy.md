@@ -119,7 +119,7 @@ Expected: FAIL because `_middleware_failure_modes` and closed-mode handling do n
 
 - [ ] **Step 3: Add explicit middleware failure metadata**
 
-Keep `_middleware` as the existing callback list for compatibility and add a side-table keyed by `(kind, id(callback))`. Validate the registration option:
+Keep `_middleware` as the existing callback list for compatibility and add `PluginManager._middleware_failure_modes: dict[tuple[str, int], str]`, keyed by `(kind, id(callback))`. Do not invent a second middleware registry. Extend the existing registrar directly:
 
 ```python
 VALID_MIDDLEWARE_FAILURE_MODES = frozenset({"open", "closed"})
@@ -130,18 +130,26 @@ def register_middleware(
     callback: Callable,
     *,
     failure_mode: str = "open",
-) -> None:
+) -> PluginRegistration:
     if failure_mode not in VALID_MIDDLEWARE_FAILURE_MODES:
         raise ValueError(f"unsupported middleware failure_mode: {failure_mode!r}")
-    self._manager.register_middleware(
-        self.plugin_id,
-        kind,
-        callback,
-        failure_mode=failure_mode,
-    )
+    if kind not in VALID_MIDDLEWARE:
+        logger.warning(
+            "Plugin '%s' registered unknown middleware '%s' (valid: %s)",
+            self.manifest.name, kind, ", ".join(sorted(VALID_MIDDLEWARE)),
+        )
+    self._manager._middleware.setdefault(kind, []).append(callback)
+    mode_key = (kind, id(callback))
+    self._manager._middleware_failure_modes[mode_key] = failure_mode
+
+    def release() -> None:
+        self._manager._remove_callback(self._manager._middleware, kind, callback)
+        self._manager._middleware_failure_modes.pop(mode_key, None)
+
+    return self._track("middleware", kind, release)
 ```
 
-Manager registration must store and remove the mode when the plugin unloads. `_run_execution_chain` must re-raise the middleware callback's own exception when its mode is `closed`, including after `next_call()` succeeded. Downstream exceptions continue to propagate unchanged through `_DownstreamExecutionError`.
+Add `PluginManager.middleware_failure_mode(kind, callback) -> str` returning `"open"` when no explicit entry exists. `_run_execution_chain` must re-raise the middleware callback's own exception when its mode is `closed`, including after `next_call()` succeeded. Downstream exceptions continue to propagate unchanged through `_DownstreamExecutionError`.
 
 - [ ] **Step 4: Re-run fail-closed tests and existing middleware tests**
 
@@ -330,6 +338,7 @@ class ProtectionDecision(StrEnum):
 class PrivacyConfig:
     home: Path
     sidecar_mode: str
+    sidecar_scope: str
     sidecar_url: str
     trusted_local_providers: frozenset[str]
     mandatory_mode: bool
@@ -340,10 +349,39 @@ class PrivacyConfig:
 
     @classmethod
     def load(cls) -> "PrivacyConfig":
-        ...
+        from hermes_constants import get_default_hermes_root
+
+        override = os.getenv("GAZE_HERMES_HOME", "").strip()
+        home = (
+            Path(override).expanduser()
+            if override
+            else Path(get_default_hermes_root()) / "gaze-hermes-privacy"
+        )
+        raw = tomllib.loads((home / "config.toml").read_text("utf-8")) if (home / "config.toml").exists() else {}
+        sidecar = raw.get("sidecar", {})
+        providers = raw.get("providers", {})
+        security = raw.get("security", {})
+        scope = str(sidecar.get("scope", "host"))
+        if scope not in {"host", "profile"}:
+            raise ValueError("sidecar.scope must be 'host' or 'profile'")
+        mode = str(sidecar.get("mode", "native"))
+        if mode not in {"native", "docker", "external"}:
+            raise ValueError("sidecar.mode must be native, docker, or external")
+        return cls(
+            home=home,
+            sidecar_mode=mode,
+            sidecar_scope=scope,
+            sidecar_url=str(sidecar.get("url", "http://127.0.0.1:65113")),
+            trusted_local_providers=frozenset(map(str, providers.get("trusted_local", []))),
+            mandatory_mode=bool(security.get("mandatory", True)),
+            api_token_file=Path(sidecar.get("api_token_file", home / "secrets" / "api-token")),
+            master_key_file=Path(sidecar.get("master_key_file", home / "secrets" / "snapshot-key")),
+            global_policy_file=Path(raw.get("policy", {}).get("global_file", home / "policies" / "global.toml")),
+            profile_policy_dir=Path(raw.get("policy", {}).get("profile_dir", home / "policies" / "profiles")),
+        )
 ```
 
-The implementation must use `GAZE_HERMES_HOME` when set; otherwise resolve the host-wide Hermes root and append `gaze-hermes-privacy`. Default `sidecar_mode` is `"native"`, default URL is `http://127.0.0.1:65113`, and `mandatory_mode` defaults true.
+The implementation must use `GAZE_HERMES_HOME` when set; otherwise resolve `hermes_constants.get_default_hermes_root()` and append `gaze-hermes-privacy`, so host-scoped state is not accidentally placed inside whichever profile happens to load the plugin first. Default `sidecar_mode` is `"native"`, default `sidecar_scope` is `"host"`, default URL is `http://127.0.0.1:65113`, and `mandatory_mode` defaults true.
 
 - [ ] **Step 4: Implement exact-match provider policy**
 
@@ -395,7 +433,7 @@ git commit -m "feat: scaffold Hermes privacy plugin"
 
 **Interfaces:**
 - Consumes: API token file and process configuration.
-- Produces: sidecar process on `127.0.0.1:65113`; `GET /healthz`; authenticated `GET /v1/status`; protocol version `1`.
+- Produces: sidecar process on `127.0.0.1:65113` by default; optional `127.0.0.1:0` dynamic bind plus `--ready-file` rendezvous for per-profile mode; `GET /healthz`; authenticated `GET /v1/status`; protocol version `1`.
 
 - [ ] **Step 1: Write failing router/auth tests**
 
@@ -450,9 +488,17 @@ cargo test --manifest-path sidecar/Cargo.toml --test health_auth
 
 Expected: FAIL because router/config modules are absent.
 
-- [ ] **Step 4: Implement config, constant-time bearer auth, and status**
+- [ ] **Step 4: Implement config, constant-time bearer auth, status, and readiness rendezvous**
 
-Use `127.0.0.1:65113` as the default bind. Read the bearer token from `--api-token-file`; reject an empty/missing file. Compare equal-length byte strings using `subtle::ConstantTimeEq`.
+Use `127.0.0.1:65113` as the default bind and permit `127.0.0.1:0` only when the manager explicitly requests an ephemeral loopback port for profile-isolated mode. Read the bearer token from `--api-token-file`; reject an empty/missing file. Compare equal-length byte strings using `subtle::ConstantTimeEq`.
+
+If `--ready-file <path>` is supplied, bind the listener first, obtain `listener.local_addr()`, then atomically write a non-sensitive JSON rendezvous file:
+
+```json
+{"address":"127.0.0.1:43127","protocol_version":1}
+```
+
+The manager must never infer readiness from process existence alone.
 
 Status contract:
 
@@ -619,8 +665,11 @@ pub struct GazeModelProvisioner {
 
 impl ModelProvisioner for GazeModelProvisioner {
     fn ensure(&self) -> Result<PathBuf, ModelError> {
-        let outcome = gaze_model_setup::install_ner_bundle(self.model_dir.as_deref())?;
-        Ok(outcome.model_dir)
+        use gaze_model_setup::InstallOutcome;
+        match gaze_model_setup::install_ner_bundle(self.model_dir.as_deref())? {
+            InstallOutcome::AlreadyPresent { model_dir }
+            | InstallOutcome::Installed { model_dir } => Ok(model_dir),
+        }
     }
 }
 ```
@@ -660,8 +709,8 @@ git commit -m "feat: add Gaze policy and model runtime"
 - Create: `sidecar/tests/session_store.rs`
 
 **Interfaces:**
-- Consumes: `Namespace { profile_id, session_id }`, master-key file, Gaze `Session::export/import`.
-- Produces: `SessionRegistry::get_or_restore(&Namespace) -> Arc<SessionHandle>`; `SessionRegistry::persist(&Namespace)`; `SessionRegistry::delete(&Namespace)`.
+- Consumes: `SessionKey { profile_id, session_id }`, master-key file, Gaze `Session::export/import`.
+- Produces: `SessionRegistry::get_or_restore(&SessionKey) -> Arc<SessionHandle>`; `SessionRegistry::persist(&SessionKey)`; `SessionRegistry::delete(&SessionKey)`. `request_id` is deliberately not part of the persisted session key.
 
 - [ ] **Step 1: Add encryption dependencies and write failure tests**
 
@@ -703,16 +752,16 @@ Expected: FAIL because registry/store do not exist.
 
 - [ ] **Step 3: Implement snapshot envelope based on Gaze's proven pattern**
 
-Use:
+Use the same envelope pattern already exercised by Gaze's `gaze-mcp-bridge` file session store, adapted to a two-part namespace:
 - ChaCha20-Poly1305;
 - random 12-byte nonce;
-- AAD containing protocol version plus canonical `profile_id/session_id`;
+- AAD equal to `b"gaze-hermes-session-v1\0" + profile_id + b"\0" + session_id`;
 - a fixed magic/version header;
-- SHA-256 of the namespace for the filename;
-- `Session::export()` as plaintext before encryption;
-- `Session::import(SensitiveSnapshot::from(...))` after decryption.
+- SHA-256 of the same canonical profile/session bytes for the filename;
+- `Session::export().into_bytes()` as plaintext before encryption;
+- `Session::import(SensitiveSnapshot::from(plaintext))` after decryption.
 
-Never write plaintext snapshot bytes to disk.
+Never include `request_id` in the filename, AAD, or Gaze conversation scope. Never write plaintext snapshot bytes to disk.
 
 - [ ] **Step 4: Implement atomic persistence**
 
@@ -759,11 +808,26 @@ git commit -m "feat: persist encrypted Gaze sessions"
 - [ ] **Step 1: Define canonical field protocol and write failing tests**
 
 ```rust
+#[derive(Serialize, Deserialize, Clone, Eq, PartialEq, Hash)]
+pub struct SessionKey {
+    pub profile_id: String,
+    pub session_id: String,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
-pub struct Namespace {
+pub struct RequestNamespace {
     pub profile_id: String,
     pub session_id: String,
     pub request_id: String,
+}
+
+impl RequestNamespace {
+    pub fn session_key(&self) -> SessionKey {
+        SessionKey {
+            profile_id: self.profile_id.clone(),
+            session_id: self.session_id.clone(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -774,7 +838,7 @@ pub struct TextField {
 
 #[derive(Serialize, Deserialize)]
 pub struct CleanRequest {
-    pub namespace: Namespace,
+    pub namespace: RequestNamespace,
     pub fields: Vec<TextField>,
 }
 ```
@@ -825,7 +889,7 @@ Responses may include class/count metadata but never raw mappings:
 {
   "fields": [{"path": "/messages/0/content", "text": "Contact <token>"}],
   "detections": [{"class": "email", "count": 1}],
-  "policy_version": "sha256:..."
+  "policy_version": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 }
 ```
 
@@ -899,14 +963,17 @@ cargo test --manifest-path sidecar/Cargo.toml --test streaming
 
 Expected: FAIL because the stream restorer does not exist.
 
-- [ ] **Step 3: Implement per-lane carry buffering**
+- [ ] **Step 3: Implement per-lane carry buffering without copying Gaze's token grammar**
 
 Maintain:
 - one monotonically increasing message sequence for the WebSocket;
 - independent carry buffers keyed by `kind` (`text`, `reasoning`, `interim`);
-- a maximum carry length derived from Gaze token grammar plus a small guard margin.
+- the active session's real `Session::tokens()` set;
+- Gaze's public `gaze::token_shape` helpers for complete-token validation.
 
-The restorer may return an empty string while it holds a possible token prefix. It must never carry text from one lane into another.
+Do not hard-code the current eight-hex token grammar into this project. On each lane, retain only the trailing lexical run that could still become a protected token: from the last unmatched `<` for wrapped forms, or the trailing token-like word/email run for bracketless/format-preserving forms. Strict-restore the safe prefix immediately. When the carry becomes a complete token-shaped string, `Session::restore_strict_text` must either restore an owned token or reject an unknown token. On `finish`, strict-restore the entire remaining carry so incomplete prefixed wrappers fail closed.
+
+The restorer may return an empty string while it holds a possible token prefix. It must never carry text from one lane into another, and tests must split actual tokens returned by Gaze rather than guessed examples.
 
 - [ ] **Step 4: Implement strict WebSocket protocol**
 
@@ -953,8 +1020,8 @@ git commit -m "feat: restore protected streams over WebSocket"
 - Create: `tests/python/test_secrets.py`
 
 **Interfaces:**
-- Consumes: `PrivacyConfig`, release manifest, sidecar REST/WebSocket protocol.
-- Produces: `SidecarManager.ensure_running() -> SidecarStatus`; `SidecarClient.clean/restore/open_stream`; generated secret files with restrictive permissions.
+- Consumes: `PrivacyConfig`, active `profile_id`, release manifest, sidecar REST/WebSocket protocol.
+- Produces: `SidecarManager.ensure_running(profile_id: str) -> SidecarStatus`; `SidecarClient.clean/restore/open_stream`; generated secret files with restrictive permissions. Host scope reuses one process; profile scope returns a profile-specific endpoint/process.
 
 - [ ] **Step 1: Write secret/bootstrap tests**
 
@@ -963,7 +1030,9 @@ Tests must prove:
 - generated secrets are random and persistent across reloads;
 - POSIX permissions are `0o600`;
 - a binary with wrong SHA-256 is deleted/refused;
-- Docker/external mode never attempts a native download.
+- Docker/external mode never attempts a native download;
+- host scope reuses one compatible endpoint across profiles;
+- profile scope launches separate endpoints and state directories and consumes the sidecar `--ready-file` result rather than guessing a port.
 
 - [ ] **Step 2: Run tests and verify failure**
 
@@ -998,13 +1067,14 @@ The master-key file uses random bytes encoded safely for the Rust reader and is 
 - [ ] **Step 5: Implement native-first process management**
 
 Order:
-1. if `sidecar_mode=external`, health-check configured URL;
-2. if `sidecar_mode=docker`, health-check expected container endpoint and surface setup guidance if absent;
-3. default `native`: reuse healthy compatible sidecar or launch verified binary with secret/key/policy/state paths;
-4. poll `/healthz` until ready using a bounded startup timeout;
-5. reject protocol mismatch.
+1. if `sidecar_mode=external`, health-check the configured endpoint selected for the current scope;
+2. if `sidecar_mode=docker`, health-check the configured container endpoint and surface setup guidance if absent;
+3. default `native` + host scope: reuse the healthy compatible host sidecar or launch the verified binary on `127.0.0.1:65113`;
+4. default `native` + profile scope: launch/reuse a process under `run/<safe-profile-id>/`, pass `--bind 127.0.0.1:0 --ready-file <profile-run-dir>/ready.json`, and use the reported address;
+5. poll `/healthz` until ready using a bounded startup timeout;
+6. reject protocol mismatch.
 
-Do not kill a healthy sidecar owned by another compatible profile process.
+Use a per-scope lock/rendezvous file so two Hermes processes racing to start the same sidecar do not spawn duplicates. Host scope may be shared by profiles; profile scope must never reuse another profile's process or snapshot directory.
 
 - [ ] **Step 6: Implement REST and WebSocket client**
 
@@ -1152,7 +1222,7 @@ git commit -m "feat: adapt Hermes provider payloads for privacy"
 
 **Interfaces:**
 - Consumes: Tasks 1, 2, 8, and 9.
-- Produces: closed `llm_execution` middleware; closed `llm_stream_text` middleware; request-local stream context; sanitised `PrivacyEvent`.
+- Produces: closed `llm_execution` middleware; closed `llm_stream_text` middleware; thread-safe `StreamRegistry` keyed by `(session_id, api_request_id)`; sanitised `PrivacyEvent`.
 
 - [ ] **Step 1: Write protected-request lifecycle test**
 
@@ -1225,18 +1295,17 @@ def llm_execution_middleware(*, request, next_call, provider, api_mode, **ctx):
     cleaned = runtime.sidecar.clean(namespace_from(ctx), prepared.fields)
     protected_request = prepared.apply(cleaned.fields)
 
-    stream = runtime.sidecar.open_stream(namespace_from(ctx))
-    token = runtime.active_stream.set(stream)
+    request_key = runtime.streams.reserve(namespace_from(ctx))
     try:
         response = next_call(protected_request)
         restored = restore_completed_response(runtime, api_mode, response, ctx)
-        stream.finish()
+        runtime.streams.finish_if_open(request_key)
         return restored
     except Exception:
-        stream.abort()
+        runtime.streams.abort_if_open(request_key)
         raise
     finally:
-        runtime.active_stream.reset(token)
+        runtime.streams.release(request_key)
 ```
 
 If outbound cleaning fails, `next_call` is never invoked.
@@ -1244,12 +1313,24 @@ If outbound cleaning fails, `next_call` is never invoked.
 - [ ] **Step 6: Implement synchronous live-stream transform**
 
 ```python
-def llm_stream_text_middleware(*, text, kind, **_ctx):
-    stream = runtime.active_stream.get(None)
-    if stream is None:
-        raise PrivacyBlockedError("protected provider stream has no privacy context")
+def llm_stream_text_middleware(
+    *,
+    text,
+    kind,
+    provider,
+    session_id,
+    api_request_id,
+    **_ctx,
+):
+    if runtime.provider_policy.classify(provider) is ProtectionDecision.BYPASS:
+        return {"text": text}
+    runtime.require_fail_closed_capabilities()
+    key = (str(session_id or ""), str(api_request_id or ""))
+    stream = runtime.streams.get_or_open(key)
     return {"text": stream.feed(kind=kind, text=text)}
 ```
+
+`StreamRegistry.reserve()` runs before `next_call`; `get_or_open()` lazily opens the authenticated sidecar WebSocket on the first live delta and rejects an unknown external request key. This avoids relying on a `ContextVar` crossing Hermes' streaming worker threads and avoids opening a WebSocket for non-streaming calls. Trusted-local streams pass through unchanged.
 
 Register both middleware callbacks with `failure_mode="closed"`.
 
@@ -1451,7 +1532,7 @@ No hard-coded colours; use SDK components and theme variables.
 
 - [ ] **Step 4: Implement Live Debug**
 
-Use `ctx.socket('/events', ...)` when available and React Query polling fallback because Desktop sockets are no-op on OAuth remotes. Render request timeline metadata only.
+Use `ctx.socket('/events', onEvent)` when available and React Query polling fallback because Desktop sockets are no-op on OAuth remotes. `onEvent` must only invalidate/refill the sanitised event query; it must not persist raw event bodies in plugin storage. Render request timeline metadata only.
 
 - [ ] **Step 5: Implement status-bar state**
 
