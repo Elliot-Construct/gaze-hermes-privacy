@@ -479,11 +479,13 @@ Hermes itself continues to own and consume the provider-native stream. The new s
 
 The request's completed response object is restored separately through `llm_execution`, including tool-call arguments. Unknown or opaque outbound request carriers remain blocked under the structured-payload rules rather than being assumed safe.
 
-Conceptual endpoint:
+Endpoint:
 
 ```text
 WS /v1/streams/{stream_id}
 ```
+
+The Python client generates an opaque per-request `stream_id` and sends profile/session/request identity in the authenticated `open` message.
 
 A stream is associated with:
 
