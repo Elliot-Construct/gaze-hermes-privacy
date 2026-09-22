@@ -1604,7 +1604,7 @@ git commit -m "feat: adapt Hermes provider payloads for privacy"
 
 **Interfaces:**
 - Consumes: Tasks 1, 2, 8, and 9.
-- Produces: `PrivacyRuntime.execute(...)`; closed `llm_execution` middleware; closed `llm_stream_text` middleware; thread-safe `StreamRegistry` keyed by `(profile_id, session_id, api_request_id)`; sanitised `PrivacyEvent`.
+- Produces: `PrivacyRuntime.execute(*, request: dict[str, Any], next_call: Callable[[dict[str, Any]], Any], provider: str, api_mode: str, **context: Any) -> Any`; closed `llm_execution` middleware; closed `llm_stream_text` middleware; thread-safe `StreamRegistry` keyed by `(profile_id, session_id, api_request_id)`; sanitised `PrivacyEvent`.
 
 - [ ] **Step 1: Write protected-request lifecycle test**
 
