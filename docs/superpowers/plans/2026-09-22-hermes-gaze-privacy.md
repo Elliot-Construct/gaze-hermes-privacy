@@ -1125,12 +1125,42 @@ Expected: FAIL because the stream restorer does not exist.
 Maintain:
 - one monotonically increasing message sequence for the WebSocket;
 - independent carry buffers keyed by `kind` (`text`, `reasoning`, `interim`);
-- the active session's real `Session::tokens()` set;
-- Gaze's public `gaze::token_shape` helpers for complete-token validation.
+- the active session's exact `Session::tokens()` strings captured after request cleaning.
 
-Do not hard-code the current eight-hex token grammar into this project. On each lane, retain only the trailing lexical run that could still become a protected token: from the last unmatched `<` for wrapped forms, or the trailing token-like word/email run for bracketless/format-preserving forms. Strict-restore the safe prefix immediately. When the carry becomes a complete token-shaped string, `Session::restore_strict_text` must either restore an owned token or reject an unknown token. On `finish`, strict-restore the entire remaining carry so incomplete prefixed wrappers fail closed.
+Do not hard-code Gaze's token grammar. Retain the longest suffix of `carry + chunk` that is a proper prefix of any token actually owned by this session. Everything before that suffix is safe to pass immediately through `restore_strict_text`.
 
-The restorer may return an empty string while it holds a possible token prefix. It must never carry text from one lane into another, and tests must split actual tokens returned by Gaze rather than guessed examples.
+```rust
+fn longest_owned_token_prefix_suffix(text: &str, tokens: &[String]) -> usize {
+    let mut starts: Vec<usize> = text.char_indices().map(|(index, _)| index).collect();
+    starts.push(text.len());
+    for start in starts.into_iter().rev() {
+        let suffix = &text[start..];
+        if !suffix.is_empty()
+            && tokens.iter().any(|token| token.starts_with(suffix) && token.len() > suffix.len())
+        {
+            return suffix.len();
+        }
+    }
+    0
+}
+
+fn feed_lane(
+    session: &gaze::Session,
+    tokens: &[String],
+    carry: &mut String,
+    chunk: &str,
+) -> Result<String, StreamError> {
+    carry.push_str(chunk);
+    let held = longest_owned_token_prefix_suffix(carry, tokens);
+    let safe_len = carry.len() - held;
+    let safe = carry[..safe_len].to_string();
+    let pending = carry[safe_len..].to_string();
+    *carry = pending;
+    session.restore_strict_text(&safe).map_err(StreamError::StrictRestore)
+}
+```
+
+On `finish`, strict-restore every remaining lane carry and require success before closing. An invented/unknown token-shaped value therefore reaches Gaze's strict validator and fails closed rather than being emitted. The restorer may return an empty string while it holds a possible owned-token prefix, and lane carries are never concatenated.
 
 - [ ] **Step 4: Implement strict WebSocket protocol**
 
@@ -1244,9 +1274,46 @@ Order:
 
 Use a per-scope lock/rendezvous file so two Hermes processes racing to start the same sidecar do not spawn duplicates. Host scope may be shared by profiles; profile scope must never reuse another profile's process or snapshot directory.
 
+```python
+def ensure_running(self, profile_id: str) -> ManagedSidecar:
+    scope = "host" if self.config.sidecar_scope == "host" else safe_profile_id(profile_id)
+    with self._scope_lock(scope):
+        endpoint = self._existing_healthy_endpoint(scope)
+        if endpoint is None:
+            endpoint = self._launch_or_resolve_endpoint(scope, profile_id)
+        client = SidecarClient(endpoint, token=self._api_token())
+        status = client.status()
+        if status.protocol_version != SIDECAR_PROTOCOL_VERSION:
+            raise PrivacyProtocolError("sidecar protocol mismatch")
+        return ManagedSidecar(status=status, client=client)
+```
+
 - [ ] **Step 6: Implement REST and WebSocket client**
 
-Use Hermes' existing `websockets` dependency and a standard HTTP client already available in Hermes. `StreamClient.feed(kind, text) -> str` serialises sends under a lock and verifies returned sequence numbers.
+Use Hermes' existing `websockets` and `httpx` dependencies. `StreamClient.feed(kind, text) -> str` serialises sends under a lock and verifies returned sequence numbers.
+
+```python
+class SidecarClient:
+    def __init__(self, base_url: str, token: str):
+        self.base_url = base_url.rstrip("/")
+        self.headers = {"Authorization": f"Bearer {token}"}
+
+    def clean(self, namespace: dict, fields: list[dict]) -> dict:
+        response = httpx.post(
+            f"{self.base_url}/v1/clean",
+            headers=self.headers,
+            json={"namespace": namespace, "fields": fields},
+            timeout=30.0,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def open_stream(self, namespace: dict) -> "StreamClient":
+        ws_url = self.base_url.replace("http://", "ws://", 1) + "/v1/streams/new"
+        return StreamClient.connect(ws_url, self.headers, namespace)
+```
+
+The real client uses the same bounded timeout and sanitised error translation for restore, policy, and session endpoints.
 
 - [ ] **Step 7: Run tests**
 
@@ -1284,15 +1351,41 @@ git commit -m "feat: manage native privacy sidecar"
 
 - [ ] **Step 1: Write request extraction tests for every supported wire shape**
 
-Protect text-bearing fields while preserving structural identifiers.
+Protect text-bearing fields while preserving structural identifiers. Cover each wire family with a concrete fixture:
 
-Examples:
-- Chat/OpenAI-compatible: message text/content parts, system/developer content, tool results, tool descriptions, JSON-schema descriptions.
-- Anthropic Messages: system blocks, message text blocks, tool-result text, tool descriptions/input-schema descriptions.
-- Responses/Codex: `instructions`, `input` text blocks, tool descriptions/schema descriptions.
-- Bedrock Converse: system text, message text blocks, tool descriptions/schema descriptions.
+```python
+@pytest.mark.parametrize(
+    ("api_mode", "payload", "expected_paths"),
+    [
+        (
+            "chat_completions",
+            {"model": "m", "messages": [{"role": "user", "content": "Email alice@example.invalid"}]},
+            ["/messages/0/content"],
+        ),
+        (
+            "anthropic_messages",
+            {"model": "m", "system": "Contact Alice", "messages": [{"role": "user", "content": [{"type": "text", "text": "York"}]}]},
+            ["/system", "/messages/0/content/0/text"],
+        ),
+        (
+            "codex_responses",
+            {"model": "m", "instructions": "Contact Alice", "input": [{"role": "user", "content": [{"type": "input_text", "text": "York"}]}]},
+            ["/instructions", "/input/0/content/0/text"],
+        ),
+        (
+            "bedrock_converse",
+            {"modelId": "m", "messages": [{"role": "user", "content": [{"text": "Email alice@example.invalid"}]}]},
+            ["/messages/0/content/0/text"],
+        ),
+    ],
+)
+def test_supported_wire_extracts_only_text_fields(api_mode, payload, expected_paths):
+    prepared = extract_request_fields(api_mode, payload, mandatory=True)
+    assert [field.path for field in prepared.fields] == expected_paths
+    assert prepared.payload.get("model", prepared.payload.get("modelId")) == "m"
+```
 
-Assert model IDs, roles, content-part `type`, function/tool names, and schema property keys are not modified.
+Additional fixtures cover tool results, tool descriptions, and JSON-schema descriptions. Assert model IDs, roles, content-part `type`, function/tool names, and schema property keys are not modified.
 
 - [ ] **Step 2: Add Review Focus test for opaque/multimodal content**
 
@@ -1345,19 +1438,18 @@ Never recursively transform all strings blindly.
 
 - [ ] **Step 5: Implement completed-response extraction**
 
-For Chat/Anthropic/Bedrock-normalised responses restore:
-- `choices[].message.content`;
-- reasoning text when present;
-- refusal text;
-- `tool_calls[].function.arguments`.
+For Chat/Anthropic/Bedrock-normalised responses restore `choices[].message.content`, reasoning/refusal text, and `tool_calls[].function.arguments`. For Responses/Codex restore message output/refusal/commentary text, function-call `arguments`, and `output_text`.
 
-For Responses/Codex restore:
-- message output text/refusal text;
-- function-call `arguments`;
-- visible commentary text;
-- `output_text` if present.
+```python
+def restore_completed_response(client, namespace, api_mode, response):
+    prepared = extract_response_fields(api_mode, response)
+    if not prepared.fields:
+        return response
+    restored = client.restore(namespace, prepared.fields)
+    return prepared.apply(restored["fields"])
+```
 
-Encrypted signatures, IDs, model names, tool names, and structural metadata are never transformed.
+The response extractor must leave encrypted signatures, IDs, model names, tool names, and structural metadata untouched. Add a test where a `write_file` argument contains a Gaze token and assert only the argument string is restored.
 
 - [ ] **Step 6: Run tests**
 
