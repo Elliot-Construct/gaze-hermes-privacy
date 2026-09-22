@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Git worktrees
+.worktrees/
+
+# SDD scratch
+.superpowers/
