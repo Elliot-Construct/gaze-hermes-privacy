@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- The project is open-source and vendor-neutral; no DataWyse-specific branding, policies, paths, or assumptions.
+- The project is open-source and vendor-neutral; no company-specific branding, policies, paths, or assumptions.
 - No permanent Hermes fork.
 - External providers are protected by default; only explicitly allowlisted trusted-local providers bypass Gaze.
 - No automatic trust inference from localhost, loopback IPs, Ollama, vLLM, provider names, or network placement.
