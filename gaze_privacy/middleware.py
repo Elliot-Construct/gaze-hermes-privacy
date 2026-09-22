@@ -9,6 +9,7 @@ from gaze_privacy.events import EventBuffer
 from gaze_privacy.provider_policy import ProviderPolicy, ProtectionDecision
 from gaze_privacy.config import PrivacyConfig
 from gaze_privacy.sidecar_manager import SidecarManager
+from gaze_privacy.plugin_api_service import PluginApiService
 
 
 _runtime: PrivacyRuntime | None = None
@@ -30,6 +31,8 @@ def init_runtime(
         sidecars=sidecars,
         events=events,
     )
+    # Initialize plugin API service
+    _runtime.plugin_api_service = PluginApiService(_runtime)
     return _runtime
 
 
@@ -47,8 +50,8 @@ def llm_execution_middleware(
     api_mode: str,
     **context: Any,
 ) -> Any:
-    """llm_execution middleware callback for Hermes."""
-    return get_runtime().execute(
+    """llm_execution middleware callback for Hermes (synchronous)."""
+    return get_runtime().execute_sync(
         request=request,
         next_call=next_call,
         provider=provider,
@@ -67,7 +70,7 @@ def llm_stream_text_middleware(
     api_request_id: str,
     **_ctx: Any,
 ) -> dict[str, str]:
-    """llm_stream_text middleware callback for Hermes."""
+    """llm_stream_text middleware callback for Hermes (synchronous)."""
     runtime = get_runtime()
 
     if runtime.provider_policy.classify(provider) is ProtectionDecision.BYPASS:
@@ -81,5 +84,5 @@ def llm_stream_text_middleware(
         str(api_request_id or ""),
     )
     stream = runtime.streams.get_or_open(key)
-    restored = stream.feed(kind=kind, text=text)
+    restored = stream.feed_sync(kind=kind, text=text)
     return {"text": restored}

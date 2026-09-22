@@ -63,27 +63,21 @@ jobs:
 
       - name: Build Rust
         run: cargo build --locked --release --manifest-path sidecar/Cargo.toml --target ${{ matrix.target }}
-        working-directory: .worktrees/gaze-privacy
 
       - name: Run Rust tests
         run: cargo test --locked --manifest-path sidecar/Cargo.toml --target ${{ matrix.target }}
-        working-directory: .worktrees/gaze-privacy
 
       - name: Install Python deps
         run: pip install -e .[dev]
-        working-directory: .worktrees/gaze-privacy
 
       - name: Run Python tests
         run: pytest tests/python -v
-        working-directory: .worktrees/gaze-privacy
 
       - name: Run Desktop tests
         if: runner.os == 'Linux'
         run: |
-          cd .worktrees/gaze-privacy
           node --check desktop/plugin.js
           npm run test:desktop
-        working-directory: .
 
   linux-quality:
     needs: test-matrix
@@ -119,36 +113,26 @@ jobs:
 
       - name: Install Python deps
         run: pip install -e .[dev]
-        working-directory: .worktrees/gaze-privacy
 
       - name: cargo fmt --check
         run: cargo fmt --manifest-path sidecar/Cargo.toml -- --check
-        working-directory: .worktrees/gaze-privacy
 
       - name: cargo clippy
         run: cargo clippy --manifest-path sidecar/Cargo.toml --all-targets -- -D warnings
-        working-directory: .worktrees/gaze-privacy
 
       - name: Desktop ESM tests
         run: |
-          cd .worktrees/gaze-privacy
           node --check desktop/plugin.js
           npm run test:desktop
-        working-directory: .
 
       - name: Synthetic e2e tests
         run: pytest tests/e2e -v
-        working-directory: .worktrees/gaze-privacy
 
       - name: Docker smoke
         run: |
-          cd .worktrees/gaze-privacy
           docker compose config
           bash scripts/docker-smoke.sh
-        working-directory: .
 
       - name: Forbidden fixture scan
         run: |
-          cd .worktrees/gaze-privacy
           grep -r "alice@example\.com\|bob@example\.com\|real.*email\|real.*phone" tests/ --include="*.py" --include="*.json" || true
-        working-directory: .

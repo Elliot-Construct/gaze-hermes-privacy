@@ -6,12 +6,13 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from gaze_privacy.events import EventBuffer, PrivacyEvent, create_event
-from gaze_privacy.sidecar_client import SidecarClient
+from gaze_privacy.sidecar_client import SidecarClient, StreamClient
 from gaze_privacy.adapters import (
     extract_request_fields,
     restore_completed_response,
     TextField,
 )
+from gaze_privacy.errors import PrivacyBlockedError
 
 
 @dataclass(frozen=True)
@@ -24,10 +25,10 @@ class StreamRegistry:
     """Thread-safe registry for streaming restoration clients."""
 
     def __init__(self):
-        self._streams: dict[tuple[str, str, str], Any] = {}
+        self._streams: dict[tuple[str, str, str], StreamClient] = {}
         self._lock = __import__("threading").Lock()
 
-    def reserve(self, namespace: dict[str, str], client: Any) -> tuple[str, str, str]:
+    def reserve(self, namespace: dict[str, str], client: StreamClient) -> tuple[str, str, str]:
         key = (
             str(namespace.get("profile_id", "default")),
             str(namespace.get("session_id", "")),
@@ -38,7 +39,7 @@ class StreamRegistry:
                 self._streams[key] = client
         return key
 
-    def get_or_open(self, key: tuple[str, str, str]) -> Any:
+    def get_or_open(self, key: tuple[str, str, str]) -> StreamClient:
         with self._lock:
             if key not in self._streams:
                 raise KeyError(f"Stream key not found: {key}")
@@ -87,6 +88,7 @@ class PrivacyRuntime:
         self.sidecars = sidecars
         self.events = events
         self.streams = StreamRegistry()
+        self.plugin_api_service = None  # Set by init_runtime
 
     def require_or_mark_capabilities(self, *, provider: str, context: dict) -> None:
         if self.capabilities.fail_closed and self.capabilities.stream_text:
@@ -115,6 +117,7 @@ class PrivacyRuntime:
         api_mode: str,
         **context: Any,
     ) -> Any:
+        """Async execution for tests and async contexts."""
         from gaze_privacy.provider_policy import ProtectionDecision
 
         if self.provider_policy.classify(provider) is ProtectionDecision.BYPASS:
@@ -161,6 +164,75 @@ class PrivacyRuntime:
             raise
         finally:
             self.streams.release(request_key)
+
+    def execute_sync(
+        self,
+        *,
+        request: dict[str, Any],
+        next_call: Callable[[dict[str, Any]], Any],
+        provider: str,
+        api_mode: str,
+        **context: Any,
+    ) -> Any:
+        """Synchronous execution for Hermes middleware."""
+        import asyncio
+        return asyncio.run(self.execute(
+            request=request,
+            next_call=next_call,
+            provider=provider,
+            api_mode=api_mode,
+            **context,
+        ))
+
+    async def stream_text(
+        self,
+        *,
+        text: str,
+        kind: str,
+        provider: str,
+        profile_id: str,
+        session_id: str,
+        api_request_id: str,
+        **_ctx: Any,
+    ) -> dict[str, str]:
+        """Async streaming text restoration for tests and async contexts."""
+        from gaze_privacy.provider_policy import ProtectionDecision
+
+        if self.provider_policy.classify(provider) is ProtectionDecision.BYPASS:
+            return {"text": text}
+
+        self.require_or_mark_capabilities(provider=provider, context=_ctx)
+
+        key = (
+            str(profile_id or "default"),
+            str(session_id or ""),
+            str(api_request_id or ""),
+        )
+        stream = self.streams.get_or_open(key)
+        restored = await stream.feed(kind=kind, text=text)
+        return {"text": restored}
+
+    def stream_text_sync(
+        self,
+        *,
+        text: str,
+        kind: str,
+        provider: str,
+        profile_id: str,
+        session_id: str,
+        api_request_id: str,
+        **_ctx: Any,
+    ) -> dict[str, str]:
+        """Synchronous streaming text restoration for Hermes middleware."""
+        import asyncio
+        return asyncio.run(self.stream_text(
+            text=text,
+            kind=kind,
+            provider=provider,
+            profile_id=profile_id,
+            session_id=session_id,
+            api_request_id=api_request_id,
+        ))
 
 
 def llm_execution_middleware(**kwargs):

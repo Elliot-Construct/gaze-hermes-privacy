@@ -7,15 +7,15 @@ services:
     ports:
       - "127.0.0.1:65113:65113"
     environment:
-      - GAZE_API_TOKEN_FILE=/secrets/api-token
-      - GAZE_MASTER_KEY_FILE=/secrets/snapshot-key
-      - GAZE_POLICY_FILE=/policies/global.toml
-      - GAZE_BIND=0.0.0.0:65113
+      - GAZE_SIDECAR_API_TOKEN_FILE=/secrets/api-token
+      - GAZE_SIDECAR_MASTER_KEY_FILE=/secrets/snapshot-key
+      - GAZE_SIDECAR_DATA_DIR=/data
+      - GAZE_SIDECAR_BIND=127.0.0.1:65113
     volumes:
       - ../gaze_privacy/secrets/api-token:/secrets/api-token:ro
       - ../gaze_privacy/secrets/snapshot-key:/secrets/snapshot-key:ro
       - ../policies/global.toml:/policies/global.toml:ro
-      - gaze-state:/state
+      - gaze-state:/data
     restart: unless-stopped
 
 volumes:

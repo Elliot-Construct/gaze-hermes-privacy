@@ -27,6 +27,10 @@ pub struct Config {
     /// Data directory for policies and encrypted session snapshots.
     #[arg(long, env = "GAZE_SIDECAR_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
+
+    /// Path to the snapshot master key file. If not provided, a key is generated/stored in the data directory.
+    #[arg(long, env = "GAZE_SIDECAR_MASTER_KEY_FILE")]
+    pub master_key_file: Option<PathBuf>,
 }
 
 impl Config {

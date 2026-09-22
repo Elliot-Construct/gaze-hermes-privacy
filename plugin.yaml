@@ -2,4 +2,4 @@ name: gaze-hermes-privacy
 version: 0.1.0
 description: "Reversible PII protection for Hermes external LLM calls via a local Gaze sidecar."
 kind: standalone
-license: MIT
+license: Apache-2.0

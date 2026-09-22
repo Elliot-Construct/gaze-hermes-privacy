@@ -51,14 +51,13 @@ jobs:
 
       - name: Build release
         run: cargo build --locked --release --manifest-path sidecar/Cargo.toml --target ${{ matrix.target }}
-        working-directory: .worktrees/gaze-privacy
 
       - name: Create dist directory
         run: mkdir -p dist
 
       - name: Copy artifact
         run: |
-          cp .worktrees/gaze-privacy/sidecar/target/${{ matrix.target }}/release/${{ matrix.artifact }} dist/${{ matrix.artifact }}-${{ matrix.target }}
+          cp sidecar/target/${{ matrix.target }}/release/${{ matrix.artifact }} dist/${{ matrix.artifact }}-${{ matrix.target }}
 
       - name: Hash artifact
         run: sha256sum "dist/${{ matrix.artifact }}-${{ matrix.target }}" > "dist/${{ matrix.artifact }}-${{ matrix.target }}.sha256"
@@ -124,20 +123,19 @@ jobs:
           --protocol-version 1
           --artifacts-dir dist
           --output sidecar-release.json
-        working-directory: .worktrees/gaze-privacy
 
       - name: Upload manifest
         uses: actions/upload-artifact@v4
         with:
           name: sidecar-release.json
-          path: .worktrees/gaze-privacy/sidecar-release.json
+          path: sidecar-release.json
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
           files: |
             dist/*
-            .worktrees/gaze-privacy/sidecar-release.json
+            sidecar-release.json
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

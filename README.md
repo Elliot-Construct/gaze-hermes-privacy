@@ -7,7 +7,7 @@ Reversible PII protection for Hermes external LLM calls via a local Gaze sidecar
 1. Clone this repository into your Hermes plugins directory:
    ```bash
    cd ~/.hermes/plugins
-   git clone https://github.com/example/gaze-hermes-privacy
+   git clone https://github.com/Elliot-Construct/gaze-hermes-privacy
    ```
 
 2. Install Python dependencies:

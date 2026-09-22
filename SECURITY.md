@@ -8,7 +8,7 @@
 
 ## Reporting a Vulnerability
 
-Please report security vulnerabilities by emailing security@example.com.
+Please report security vulnerabilities by emailing security@elliot-construct.dev.
 
 We will acknowledge receipt within 48 hours and provide a timeline for a fix.
 

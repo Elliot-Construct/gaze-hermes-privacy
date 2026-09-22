@@ -89,10 +89,10 @@ class SidecarManager:
             raise RuntimeError(f"Sidecar binary not found or invalid: {binary}")
 
         env = os.environ.copy()
-        env["GAZE_API_TOKEN"] = self._api_token()
-        env["GAZE_MASTER_KEY"] = self._master_key()
-        env["GAZE_POLICY_FILE"] = str(self.config.global_policy_file)
-        env["GAZE_BIND"] = "127.0.0.1:65113"
+        env["GAZE_SIDECAR_API_TOKEN_FILE"] = str(self.config.api_token_file)
+        env["GAZE_SIDECAR_MASTER_KEY_FILE"] = str(self.config.master_key_file)
+        env["GAZE_SIDECAR_DATA_DIR"] = str(self.config.home / "data")
+        env["GAZE_SIDECAR_BIND"] = "127.0.0.1:65113"
 
         proc = subprocess.Popen(
             [str(binary)],
@@ -116,11 +116,11 @@ class SidecarManager:
         ready_file = run_dir / "ready.json"
 
         env = os.environ.copy()
-        env["GAZE_API_TOKEN"] = self._api_token()
-        env["GAZE_MASTER_KEY"] = self._master_key()
-        env["GAZE_POLICY_FILE"] = str(self.config.profile_policy_dir / f"{profile_id}.toml")
-        env["GAZE_BIND"] = "127.0.0.1:0"
-        env["GAZE_READY_FILE"] = str(ready_file)
+        env["GAZE_SIDECAR_API_TOKEN_FILE"] = str(self.config.api_token_file)
+        env["GAZE_SIDECAR_MASTER_KEY_FILE"] = str(self.config.master_key_file)
+        env["GAZE_SIDECAR_DATA_DIR"] = str(self.config.home / "data")
+        env["GAZE_SIDECAR_BIND"] = "127.0.0.1:0"
+        env["GAZE_SIDECAR_READY_FILE"] = str(ready_file)
 
         proc = subprocess.Popen(
             [str(binary)],
@@ -135,10 +135,19 @@ class SidecarManager:
             if ready_file.exists():
                 try:
                     data = json.loads(ready_file.read_text(encoding="utf-8"))
-                    port = data.get("port")
-                    if port:
-                        endpoint = f"http://127.0.0.1:{port}"
-                        return endpoint, proc
+                    # Support both old format (port) and new format (address)
+                    if "port" in data:
+                        port = data["port"]
+                    elif "address" in data:
+                        addr = data["address"]
+                        if isinstance(addr, str) and ":" in addr:
+                            port = int(addr.split(":")[-1])
+                        else:
+                            continue
+                    else:
+                        continue
+                    endpoint = f"http://127.0.0.1:{port}"
+                    return endpoint, proc
                 except Exception:
                     pass
             time.sleep(0.1)
