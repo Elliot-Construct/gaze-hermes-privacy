@@ -9,6 +9,8 @@ from gaze_privacy.release_manifest import ReleaseManifest, Artifact, ManifestErr
 from gaze_privacy.events import PrivacyEvent, EventBuffer, create_event
 from gaze_privacy.runtime import PrivacyRuntime, HermesCapabilities, StreamRegistry
 from gaze_privacy.middleware import init_runtime, get_runtime, llm_execution_middleware, llm_stream_text_middleware
+from gaze_privacy.plugin_api_service import PluginApiService
+from gaze_privacy.reveal import RevealService, RevealGrant, RevealExpired, RevealConsumed, RevealProfileMismatch, RevealMissing
 
 __all__ = [
     "PrivacyBlockedError",
@@ -33,4 +35,11 @@ __all__ = [
     "get_runtime",
     "llm_execution_middleware",
     "llm_stream_text_middleware",
+    "PluginApiService",
+    "RevealService",
+    "RevealGrant",
+    "RevealExpired",
+    "RevealConsumed",
+    "RevealProfileMismatch",
+    "RevealMissing",
 ]
