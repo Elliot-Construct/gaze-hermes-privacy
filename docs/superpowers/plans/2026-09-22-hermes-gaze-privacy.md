@@ -583,7 +583,7 @@ git commit -m "feat: add authenticated Gaze sidecar shell"
 
 **Interfaces:**
 - Consumes: full global Gaze TOML policy plus optional profile override TOML.
-- Produces: `PolicyStore::effective(profile_id) -> EffectivePolicy`; `PolicyStore::validate(raw_toml) -> ValidationResult`; `ModelProvisioner::ensure() -> PathBuf`.
+- Produces: `PolicyStore::effective(profile_id) -> EffectivePolicy`; `PolicyStore::validate(raw_toml) -> ValidationResult`; `PolicyStore::edit(scope, expected_hash, PolicyEdit) -> EditedPolicy`; `PolicyStore::apply(scope, expected_hash, raw_toml) -> EffectivePolicy`; `ModelProvisioner::ensure() -> PathBuf`.
 
 - [ ] **Step 1: Add exact Gaze dependencies**
 
@@ -684,7 +684,34 @@ pub enum PolicyEdit {
     UpsertRecognizer(RecognizerEdit),
     RemoveRecognizer { name: String },
 }
+
+pub enum PolicyScope {
+    Global,
+    Profile(String),
+}
 ```
+
+Policy changes use optimistic concurrency and atomic activation. `edit` returns a candidate TOML document without changing the active policy. `apply` checks `expected_hash`, parses and builds the candidate pipeline first, then atomically writes the canonical TOML and swaps the in-memory effective policy only after every validation/build step succeeds:
+
+```rust
+pub fn apply(
+    &self,
+    scope: PolicyScope,
+    expected_hash: &str,
+    raw_toml: &str,
+) -> Result<EffectivePolicy, PolicyStoreError> {
+    let current = self.document_for(&scope)?;
+    if sha256_hex(current.as_bytes()) != expected_hash {
+        return Err(PolicyStoreError::Conflict);
+    }
+    let candidate = self.build_candidate(&scope, raw_toml)?;
+    atomic_write(self.path_for(&scope), raw_toml.as_bytes())?;
+    self.install_candidate(scope, candidate.clone())?;
+    Ok(candidate)
+}
+```
+
+Tests must prove a bad candidate or stale `expected_hash` leaves both the file and active pipeline unchanged.
 
 - [ ] **Step 6: Implement NER model provisioning behind a trait**
 
@@ -929,19 +956,33 @@ git commit -m "feat: persist encrypted Gaze sessions"
 
 ---
 
-### Task 6: Transactional clean/restore REST API
+### Task 6: Transactional privacy and management REST API
 
 **Files:**
 - Create: `sidecar/src/api/privacy.rs`
+- Create: `sidecar/src/api/policies.rs`
+- Create: `sidecar/src/api/sessions.rs`
+- Create: `sidecar/src/api/metrics.rs`
 - Modify: `sidecar/src/api/mod.rs`
 - Modify: `sidecar/src/sessions/mod.rs`
 - Create: `sidecar/tests/privacy_api.rs`
+- Create: `sidecar/tests/management_api.rs`
 
 **Interfaces:**
 - Consumes: `PolicyStore`, `SessionRegistry`.
 - Produces:
   - `POST /v1/clean`
   - `POST /v1/restore`
+  - `POST /v1/policies/validate`
+  - `POST /v1/policies/test`
+  - `POST /v1/policies/edit`
+  - `POST /v1/policies/apply`
+  - `GET /v1/policies/effective`
+  - `GET /v1/sessions`
+  - `GET /v1/sessions/{profile_id}/{session_id}`
+  - `POST /v1/sessions/{profile_id}/{session_id}/recover`
+  - `DELETE /v1/sessions/{profile_id}/{session_id}`
+  - `GET /v1/metrics`
   - canonical `SessionKey`, `RequestNamespace`, `TextField`, `CleanRequest/Response`, `RestoreRequest/Response`.
 
 - [ ] **Step 1: Define canonical field protocol and write failing tests**
@@ -1050,21 +1091,64 @@ Responses may include class/count metadata but never raw mappings:
 }
 ```
 
-- [ ] **Step 6: Run tests**
+- [ ] **Step 6: Expose authenticated policy/session management routes**
+
+All routes in this step use the bearer middleware from Task 3. Policy test operations use a temporary Gaze session and never modify the active policy or contact an LLM provider.
+
+```rust
+async fn validate_policy(
+    State(state): State<AppState>,
+    Json(request): Json<PolicyDocumentRequest>,
+) -> Result<Json<ValidationResponse>, ApiError> {
+    Ok(Json(state.policies.validate(&request.toml)?))
+}
+
+async fn apply_policy(
+    State(state): State<AppState>,
+    Json(request): Json<PolicyApplyRequest>,
+) -> Result<Json<EffectivePolicyResponse>, ApiError> {
+    let effective = state.policies.apply(
+        request.scope,
+        &request.expected_hash,
+        &request.toml,
+    )?;
+    Ok(Json(EffectivePolicyResponse::from(effective)))
+}
+
+async fn delete_session(
+    State(state): State<AppState>,
+    Path((profile_id, session_id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    state.sessions.delete(&SessionKey { profile_id, session_id }).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+```
+
+`GET /v1/sessions` and the per-session GET return only namespace, timestamps, snapshot/recovery state, mapping count, and policy hash. They never return token-to-raw mappings. `POST /recover` calls `get_or_restore` and reports success/error without exporting mappings. `GET /v1/metrics` exposes aggregate counters/latency only.
+
+Add management API tests proving:
+- every management route except `/healthz` returns 401 without bearer auth;
+- invalid policy apply leaves the active hash unchanged;
+- stale `expected_hash` returns 409;
+- policy test round-trips synthetic text without changing the active policy;
+- session list/get never contains raw values or tokens;
+- deleting a session removes its encrypted snapshot.
+
+- [ ] **Step 7: Run tests**
 
 Run:
 
 ```bash
-cargo test --manifest-path sidecar/Cargo.toml --test privacy_api
+cargo test --manifest-path sidecar/Cargo.toml --test privacy_api --test management_api
 ```
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add sidecar/src/api sidecar/src/sessions/mod.rs sidecar/tests/privacy_api.rs
-git commit -m "feat: add transactional privacy API"
+git add sidecar/src/api sidecar/src/sessions/mod.rs sidecar/tests/privacy_api.rs sidecar/tests/management_api.rs
+git commit -m "feat: add transactional privacy management API"
 ```
 
 ---
