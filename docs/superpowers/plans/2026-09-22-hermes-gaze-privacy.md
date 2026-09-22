@@ -59,7 +59,7 @@
 
 **Interfaces:**
 - Consumes: current Hermes `PluginContext.register_middleware(kind: str, callback: Callable)`, `run_llm_execution_middleware(request: Dict[str, Any], next_call: Callable[[Dict[str, Any]], Any], **context: Any) -> Any`, and stream delivery methods.
-- Produces: `PluginContext.register_middleware(kind, callback, *, failure_mode="open")` with `failure_mode in {"open","closed"}`; new middleware kind `llm_stream_text`; `apply_llm_stream_text_middleware(text: str, *, kind: str, **context) -> str`; additive `api_request_id` in stream context.
+- Produces: `PluginContext.register_middleware(kind, callback, *, failure_mode="open")` with `failure_mode in {"open","closed"}`; new middleware kind `llm_stream_text`; `apply_llm_stream_text_middleware(text: str, *, kind: str, **context) -> str`; additive `profile_id` and `api_request_id` in stream context.
 
 - [ ] **Step 1: Write failing fail-closed execution tests**
 
@@ -262,7 +262,24 @@ def apply_llm_stream_text_middleware(text: str, *, kind: str, **context: Any) ->
     return current
 ```
 
-In `agent/stream_delivery.py`, add `api_request_id` to `_stream_hook_base_payload()`, then call the transform synchronously before delivering text, reasoning, and completed interim commentary:
+In `agent/stream_delivery.py`, add canonical `profile_id` and `api_request_id` to `_stream_hook_base_payload()`:
+
+```python
+def _stream_hook_base_payload(self) -> Dict[str, Any]:
+    from hermes_constants import get_hermes_home, profile_name_for_home
+    return {
+        "turn_id": getattr(self, "_current_turn_id", "") or "",
+        "iteration": int(getattr(self, "_api_call_count", 0) or 0),
+        "session_id": self.session_id or "",
+        "profile_id": profile_name_for_home(get_hermes_home()) or "default",
+        "api_request_id": getattr(self, "_current_api_request_id", "") or "",
+        "model": self.model or "",
+        "provider": self.provider or "",
+        "surface": self.platform or "cli",
+    }
+```
+
+Then call the transform synchronously before delivering text, reasoning, and completed interim commentary:
 
 ```python
 text = apply_llm_stream_text_middleware(
@@ -1587,7 +1604,7 @@ git commit -m "feat: adapt Hermes provider payloads for privacy"
 
 **Interfaces:**
 - Consumes: Tasks 1, 2, 8, and 9.
-- Produces: closed `llm_execution` middleware; closed `llm_stream_text` middleware; thread-safe `StreamRegistry` keyed by `(session_id, api_request_id)`; sanitised `PrivacyEvent`.
+- Produces: `PrivacyRuntime.execute(...)`; closed `llm_execution` middleware; closed `llm_stream_text` middleware; thread-safe `StreamRegistry` keyed by `(profile_id, session_id, api_request_id)`; sanitised `PrivacyEvent`.
 
 - [ ] **Step 1: Write protected-request lifecycle test**
 
@@ -1705,40 +1722,42 @@ Expected: FAIL because runtime middleware is absent.
 Exact ordering:
 
 ```python
-def llm_execution_middleware(*, request, next_call, provider, api_mode, **ctx):
-    if runtime.provider_policy.classify(provider) is ProtectionDecision.BYPASS:
-        runtime.events.record_bypass(provider=provider, **ctx)
-        return next_call(request)
+class PrivacyRuntime:
+    def execute(self, *, request, next_call, provider, api_mode, **ctx):
+        if self.provider_policy.classify(provider) is ProtectionDecision.BYPASS:
+            self.events.record_bypass(provider=provider, **ctx)
+            return next_call(request)
 
-    runtime.require_fail_closed_capabilities()
+        self.require_fail_closed_capabilities()
 
-    from hermes_constants import get_hermes_home, profile_name_for_home
-    profile_id = profile_name_for_home(get_hermes_home()) or "default"
-    managed = runtime.sidecars.ensure_running(profile_id)
-    namespace = namespace_from(ctx, profile_id=profile_id)
+        from hermes_constants import get_hermes_home, profile_name_for_home
+        profile_id = profile_name_for_home(get_hermes_home()) or "default"
+        managed = self.sidecars.ensure_running(profile_id)
+        namespace = namespace_from(ctx, profile_id=profile_id)
 
-    prepared = extract_request_fields(api_mode, request, mandatory=runtime.config.mandatory_mode)
-    cleaned = managed.client.clean(namespace, prepared.fields)
-    protected_request = prepared.apply(cleaned.fields)
+        prepared = extract_request_fields(api_mode, request, mandatory=self.config.mandatory_mode)
+        cleaned = managed.client.clean(namespace, prepared.fields)
+        protected_request = prepared.apply(cleaned.fields)
 
-    request_key = runtime.streams.reserve(namespace, client=managed.client)
-    try:
-        response = next_call(protected_request)
-        restored = restore_completed_response(
-            runtime,
-            managed.client,
-            namespace,
-            api_mode,
-            response,
-            ctx,
-        )
-        runtime.streams.finish_if_open(request_key)
-        return restored
-    except Exception:
-        runtime.streams.abort_if_open(request_key)
-        raise
-    finally:
-        runtime.streams.release(request_key)
+        request_key = self.streams.reserve(namespace, client=managed.client)
+        try:
+            response = next_call(protected_request)
+            restored = restore_completed_response(
+                managed.client,
+                namespace,
+                api_mode,
+                response,
+            )
+            self.streams.finish_if_open(request_key)
+            return restored
+        except Exception:
+            self.streams.abort_if_open(request_key)
+            raise
+        finally:
+            self.streams.release(request_key)
+
+def llm_execution_middleware(**kwargs):
+    return runtime.execute(**kwargs)
 ```
 
 If outbound cleaning fails, `next_call` is never invoked.
@@ -1751,6 +1770,7 @@ def llm_stream_text_middleware(
     text,
     kind,
     provider,
+    profile_id,
     session_id,
     api_request_id,
     **_ctx,
@@ -1758,12 +1778,16 @@ def llm_stream_text_middleware(
     if runtime.provider_policy.classify(provider) is ProtectionDecision.BYPASS:
         return {"text": text}
     runtime.require_fail_closed_capabilities()
-    key = (str(session_id or ""), str(api_request_id or ""))
+    key = (
+        str(profile_id or "default"),
+        str(session_id or ""),
+        str(api_request_id or ""),
+    )
     stream = runtime.streams.get_or_open(key)
     return {"text": stream.feed(kind=kind, text=text)}
 ```
 
-`StreamRegistry.reserve(namespace, client=managed.client)` runs before `next_call` and stores the exact profile-aware client selected by `SidecarManager`. `get_or_open()` lazily opens that client's authenticated sidecar WebSocket on the first live delta and rejects an unknown external request key. The reservation key remains `(session_id, api_request_id)` because Hermes session IDs are already runtime-unique; the stored reservation carries `profile_id` and must verify it on access. This avoids relying on a `ContextVar` crossing Hermes' streaming worker threads and avoids opening a WebSocket for non-streaming calls. Trusted-local streams pass through unchanged.
+`StreamRegistry.reserve(namespace, client=managed.client)` runs before `next_call` and stores the exact profile-aware client selected by `SidecarManager` under `(profile_id, session_id, api_request_id)`. `get_or_open()` lazily opens that client's authenticated sidecar WebSocket on the first live delta and rejects an unknown request key. This avoids relying on implicit cross-profile uniqueness or a `ContextVar` crossing Hermes' streaming worker threads, and avoids opening a WebSocket for non-streaming calls. Trusted-local streams pass through unchanged.
 
 Register both middleware callbacks with `failure_mode="closed"`.
 
