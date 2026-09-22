@@ -839,7 +839,7 @@ git commit -m "feat: persist encrypted Gaze sessions"
 - Produces:
   - `POST /v1/clean`
   - `POST /v1/restore`
-  - canonical `Namespace`, `TextField`, `CleanRequest/Response`, `RestoreRequest/Response`.
+  - canonical `SessionKey`, `RequestNamespace`, `TextField`, `CleanRequest/Response`, `RestoreRequest/Response`.
 
 - [ ] **Step 1: Define canonical field protocol and write failing tests**
 
@@ -1057,7 +1057,7 @@ git commit -m "feat: restore protected streams over WebSocket"
 
 **Interfaces:**
 - Consumes: `PrivacyConfig`, active `profile_id`, release manifest, sidecar REST/WebSocket protocol.
-- Produces: `SidecarManager.ensure_running(profile_id: str) -> SidecarStatus`; `SidecarClient.clean/restore/open_stream`; generated secret files with restrictive permissions. Host scope reuses one process; profile scope returns a profile-specific endpoint/process.
+- Produces: `SidecarManager.ensure_running(profile_id: str) -> ManagedSidecar`; `ManagedSidecar { status: SidecarStatus, client: SidecarClient }`; `SidecarClient.clean/restore/open_stream`; generated secret files with restrictive permissions. Host scope reuses one process/client; profile scope returns a profile-specific endpoint/process/client.
 
 - [ ] **Step 1: Write secret/bootstrap tests**
 
@@ -1099,6 +1099,17 @@ The master-key file uses random bytes encoded safely for the Rust reader and is 
 - [ ] **Step 4: Implement native artifact verification**
 
 `sidecar-release.json` maps platform/architecture to URL, SHA-256, and sidecar protocol version. Download to a temporary file, hash it, set executable permissions only after the hash matches, then atomically rename into `bin/`.
+
+Define:
+
+```python
+@dataclass(frozen=True)
+class ManagedSidecar:
+    status: SidecarStatus
+    client: SidecarClient
+```
+
+`ensure_running(profile_id)` returns the client bound to the endpoint it actually verified. Callers never reconstruct an endpoint from config after startup.
 
 - [ ] **Step 5: Implement native-first process management**
 
@@ -1325,16 +1336,27 @@ def llm_execution_middleware(*, request, next_call, provider, api_mode, **ctx):
         return next_call(request)
 
     runtime.require_fail_closed_capabilities()
-    runtime.sidecar.ensure_running()
+
+    from hermes_constants import get_hermes_home, profile_name_for_home
+    profile_id = profile_name_for_home(get_hermes_home()) or "default"
+    managed = runtime.sidecars.ensure_running(profile_id)
+    namespace = namespace_from(ctx, profile_id=profile_id)
 
     prepared = extract_request_fields(api_mode, request, mandatory=runtime.config.mandatory_mode)
-    cleaned = runtime.sidecar.clean(namespace_from(ctx), prepared.fields)
+    cleaned = managed.client.clean(namespace, prepared.fields)
     protected_request = prepared.apply(cleaned.fields)
 
-    request_key = runtime.streams.reserve(namespace_from(ctx))
+    request_key = runtime.streams.reserve(namespace, client=managed.client)
     try:
         response = next_call(protected_request)
-        restored = restore_completed_response(runtime, api_mode, response, ctx)
+        restored = restore_completed_response(
+            runtime,
+            managed.client,
+            namespace,
+            api_mode,
+            response,
+            ctx,
+        )
         runtime.streams.finish_if_open(request_key)
         return restored
     except Exception:
@@ -1366,7 +1388,7 @@ def llm_stream_text_middleware(
     return {"text": stream.feed(kind=kind, text=text)}
 ```
 
-`StreamRegistry.reserve()` runs before `next_call`; `get_or_open()` lazily opens the authenticated sidecar WebSocket on the first live delta and rejects an unknown external request key. This avoids relying on a `ContextVar` crossing Hermes' streaming worker threads and avoids opening a WebSocket for non-streaming calls. Trusted-local streams pass through unchanged.
+`StreamRegistry.reserve(namespace, client=...)` runs before `next_call` and stores the exact profile-aware client selected by `SidecarManager`. `get_or_open()` lazily opens that client's authenticated sidecar WebSocket on the first live delta and rejects an unknown external request key. The reservation key remains `(session_id, api_request_id)` because Hermes session IDs are already runtime-unique; the stored reservation carries `profile_id` and must verify it on access. This avoids relying on a `ContextVar` crossing Hermes' streaming worker threads and avoids opening a WebSocket for non-streaming calls. Trusted-local streams pass through unchanged.
 
 Register both middleware callbacks with `failure_mode="closed"`.
 
