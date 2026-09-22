@@ -2227,29 +2227,106 @@ git commit -m "feat: add privacy policy and session controls"
 
 - [ ] **Step 1: Write release-manifest tests**
 
-Reject:
-- unsupported platform tuple;
-- duplicate artifact tuple;
-- malformed SHA-256;
-- protocol mismatch;
-- non-HTTPS release URL outside explicitly allowed local test fixtures.
+Reject unsupported platform tuples, duplicate artifact tuples, malformed SHA-256 values, protocol mismatches, and non-HTTPS release URLs outside local fixtures.
+
+```python
+def test_release_manifest_rejects_bad_digest(tmp_path):
+    manifest = {
+        "protocol_version": 1,
+        "artifacts": [{
+            "os": "linux",
+            "arch": "x86_64",
+            "url": "https://example.invalid/sidecar",
+            "sha256": "not-a-digest",
+        }],
+    }
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ManifestError, match="sha256"):
+        load_release_manifest(path)
+
+
+def test_release_manifest_rejects_duplicate_target(tmp_path):
+    artifact = {
+        "os": "linux",
+        "arch": "x86_64",
+        "url": "https://example.invalid/sidecar",
+        "sha256": "0" * 64,
+    }
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps({"protocol_version": 1, "artifacts": [artifact, artifact]}), encoding="utf-8")
+    with pytest.raises(ManifestError, match="duplicate"):
+        load_release_manifest(path)
+```
 
 - [ ] **Step 2: Implement Docker image**
 
-Build the same Rust sidecar binary used by native installs. Runtime image runs as non-root, exposes 65113, reads secret/key files from mounted paths, and stores encrypted state on a volume. Compose publishes only `127.0.0.1:65113:65113`.
+Build the same Rust sidecar binary used by native installs. Use:
+
+```dockerfile
+FROM rust:1.89-bookworm AS build
+WORKDIR /src
+COPY sidecar ./sidecar
+RUN cargo build --locked --release --manifest-path sidecar/Cargo.toml
+
+FROM debian:bookworm-slim
+RUN useradd --system --uid 10001 --create-home gaze
+COPY --from=build /src/sidecar/target/release/gaze-hermes-sidecar /usr/local/bin/gaze-hermes-sidecar
+USER 10001:10001
+EXPOSE 65113
+ENTRYPOINT ["/usr/local/bin/gaze-hermes-sidecar"]
+```
+
+Compose runs the container with `--bind 0.0.0.0:65113`, mounts API-token/key/policy files read-only, mounts the encrypted state directory read-write, and publishes only:
+
+```yaml
+ports:
+  - "127.0.0.1:65113:65113"
+```
+
+The container may listen on all container interfaces because the host publish is loopback-only; native mode remains loopback-bound directly.
 
 - [ ] **Step 3: Implement CI test matrix**
 
-At minimum:
-- Python tests on Linux, macOS, Windows;
-- Rust format/clippy/tests on Linux plus compile/test coverage on supported release targets;
-- Desktop ESM tests;
-- synthetic privacy regression tests;
-- no-secret/log scans.
+Use an explicit GitHub Actions matrix:
+
+```yaml
+strategy:
+  fail-fast: false
+  matrix:
+    include:
+      - os: ubuntu-latest
+        target: x86_64-unknown-linux-gnu
+      - os: ubuntu-24.04-arm
+        target: aarch64-unknown-linux-gnu
+      - os: macos-15-intel
+        target: x86_64-apple-darwin
+      - os: macos-15
+        target: aarch64-apple-darwin
+      - os: windows-latest
+        target: x86_64-pc-windows-msvc
+```
+
+Each applicable job runs Python tests, `cargo test --target`, and a release build. A Linux quality job additionally runs `cargo fmt --check`, clippy, Desktop ESM tests, synthetic e2e tests, Docker smoke, and a grep-based forbidden-fixture scan over captured logs. If a named hosted runner is unavailable in the target GitHub organisation, replace it with an equivalent GitHub-hosted runner for the same architecture, without dropping the target.
 
 - [ ] **Step 4: Implement release workflow**
 
-Build supported native targets, produce SHA-256 values, attach binaries, publish Docker image, and generate/update `sidecar-release.json`. Never publish a manifest entry for a binary that did not build and test.
+Build the five native targets above, produce SHA-256 values, attach binaries, publish the Docker image, and generate `sidecar-release.json` only from successful artifacts.
+
+```yaml
+- name: Hash artifact
+  shell: bash
+  run: sha256sum "$ARTIFACT" > "$ARTIFACT.sha256"
+
+- name: Update sidecar manifest
+  run: >
+    python scripts/update-sidecar-manifest.py
+    --protocol-version 1
+    --artifacts-dir dist
+    --output sidecar-release.json
+```
+
+The manifest updater refuses a target without both a binary and checksum. Release publication depends on the full test workflow and never fabricates a missing platform entry.
 
 - [ ] **Step 5: Add and run the Docker health/auth smoke test**
 
