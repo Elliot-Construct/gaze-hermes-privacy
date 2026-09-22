@@ -1,12 +1,49 @@
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use gaze_hermes_sidecar::api::build_router;
+use gaze_hermes_sidecar::api::{build_router, AppState, Metrics};
 use gaze_hermes_sidecar::auth::AuthState;
+use gaze_hermes_sidecar::policies::PolicyStore;
+use gaze_hermes_sidecar::sessions::SessionRegistry;
 use serde_json::Value;
 use tower::util::ServiceExt;
 
+fn temp_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "gaze-health-{}-{}-{}",
+        tag,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(dir.join("policies")).unwrap();
+    std::fs::create_dir_all(dir.join("sessions")).unwrap();
+    std::fs::write(
+        dir.join("policies").join("global.toml"),
+        gaze_hermes_sidecar::config::DEFAULT_GLOBAL_POLICY,
+    )
+    .unwrap();
+    dir
+}
+
 async fn test_app(token: &str) -> axum::Router {
-    build_router(AuthState::new(token))
+    test_app_in(token, &temp_dir("health")).await
+}
+
+async fn test_app_in(token: &str, dir: &std::path::Path) -> axum::Router {
+    let policies = Arc::new(PolicyStore::open(&dir.join("policies")).unwrap());
+    let sessions = Arc::new(SessionRegistry::open(&dir.join("sessions")).unwrap());
+    let state = AppState::new(
+        AuthState::new(token),
+        policies,
+        sessions,
+        Arc::new(Metrics::default()),
+    );
+    build_router(state)
 }
 
 async fn body_json(response: axum::response::Response) -> Value {

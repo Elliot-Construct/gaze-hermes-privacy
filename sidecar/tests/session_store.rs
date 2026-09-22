@@ -39,6 +39,30 @@ fn round_trip_restore_returns_plaintext() {
     assert_eq!(bytes, b"alice@example.invalid");
 }
 
+#[tokio::test]
+async fn persist_writes_non_secret_index_and_list_reports_metadata() {
+    let dir = temp_dir("index");
+    let registry = SessionRegistry::open(&dir).unwrap();
+    let k = key("profile-a", "session-1");
+    registry.persist_marker(&k, b"alice@example.invalid").unwrap();
+
+    let index_raw = std::fs::read_to_string(dir.join("index.json")).unwrap();
+    assert!(index_raw.contains("profile-a"));
+    assert!(index_raw.contains("session-1"));
+    assert!(!index_raw.contains("alice@example.invalid"));
+
+    let listed = registry.list().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].profile_id, "profile-a");
+    assert_eq!(listed[0].session_id, "session-1");
+    assert!(listed[0].has_snapshot);
+    assert!(!listed[0].recovery_blocked);
+
+    let reopened = SessionRegistry::open(&dir).unwrap();
+    let listed = reopened.list().await.unwrap();
+    assert_eq!(listed.len(), 1);
+}
+
 #[test]
 fn wrong_master_key_fails_to_decrypt() {
     let dir = temp_dir("wrong-key");
@@ -150,9 +174,14 @@ async fn recovery_blocked_on_corrupt_snapshot_and_delete_clears() {
 
     let err = registry.get_or_restore(&k).await.unwrap_err();
     assert!(matches!(err, StoreError::RecoveryBlocked));
+    let metadata = registry.metadata(&k).await.unwrap();
+    assert!(metadata.recovery_blocked);
 
     registry.delete(&k).await.unwrap();
     assert!(!path.exists());
+    let index_raw = std::fs::read_to_string(dir.join("index.json")).unwrap();
+    assert!(!index_raw.contains("session-1"));
+
     let handle = registry.get_or_restore(&k).await.unwrap();
     assert!(handle.session.try_lock().is_ok());
 }

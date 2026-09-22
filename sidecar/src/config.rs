@@ -7,6 +7,8 @@ use clap::Parser;
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:65113";
 
+pub const DEFAULT_GLOBAL_POLICY: &str = include_str!("../../policies/default.toml");
+
 #[derive(Debug, Parser)]
 #[command(name = "gaze-hermes-sidecar", version, about)]
 pub struct Config {
@@ -21,9 +23,69 @@ pub struct Config {
     /// Optional JSON readiness rendezvous written after bind: {"address","protocol_version"}.
     #[arg(long, env = "GAZE_SIDECAR_READY_FILE")]
     pub ready_file: Option<PathBuf>,
+
+    /// Data directory for policies and encrypted session snapshots.
+    #[arg(long, env = "GAZE_SIDECAR_DATA_DIR")]
+    pub data_dir: Option<PathBuf>,
 }
 
 impl Config {
+    pub fn data_dir(&self) -> PathBuf {
+        if let Some(dir) = &self.data_dir {
+            return dir.clone();
+        }
+        if let Some(parent) = self.api_token_file.parent() {
+            if !parent.as_os_str().is_empty() {
+                return parent.join("data");
+            }
+        }
+        if let Some(dir) = std::env::var_os("LOCALAPPDATA") {
+            if !dir.is_empty() {
+                return PathBuf::from(dir).join("gaze-hermes-privacy");
+            }
+        }
+        if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
+            if !dir.is_empty() {
+                return PathBuf::from(dir).join("gaze-hermes-privacy");
+            }
+        }
+        if let Some(dir) = std::env::var_os("HOME") {
+            if !dir.is_empty() {
+                return PathBuf::from(dir)
+                    .join(".local")
+                    .join("share")
+                    .join("gaze-hermes-privacy");
+            }
+        }
+        PathBuf::from("gaze-hermes-privacy-data")
+    }
+
+    pub fn bootstrap_data_dir(&self) -> Result<PathBuf, ConfigError> {
+        let data_dir = self.data_dir();
+        let policies_dir = data_dir.join("policies");
+        let profiles_dir = policies_dir.join("profiles");
+        std::fs::create_dir_all(&profiles_dir).map_err(|source| ConfigError::DataDir {
+            path: profiles_dir.clone(),
+            source,
+        })?;
+        let global = policies_dir.join("global.toml");
+        if !global.exists() {
+            std::fs::write(&global, DEFAULT_GLOBAL_POLICY).map_err(|source| {
+                ConfigError::DataDir {
+                    path: global.clone(),
+                    source,
+                }
+            })?;
+        }
+        std::fs::create_dir_all(data_dir.join("sessions")).map_err(|source| {
+            ConfigError::DataDir {
+                path: data_dir.clone(),
+                source,
+            }
+        })?;
+        Ok(data_dir)
+    }
+
     pub fn load_token(&self) -> Result<String, ConfigError> {
         let raw = std::fs::read_to_string(&self.api_token_file).map_err(|source| {
             ConfigError::TokenRead {
@@ -51,10 +113,6 @@ impl Config {
         if !is_loopback {
             return Err(ConfigError::BindNotLoopback(self.bind));
         }
-        if self.bind.port() != 0 && self.bind.port() != 65113 {
-            // Non-default fixed ports are allowed only for external operators; still loopback.
-            return Ok(());
-        }
         Ok(())
     }
 }
@@ -70,4 +128,9 @@ pub enum ConfigError {
     TokenEmpty { path: PathBuf },
     #[error("bind address {0} is not loopback")]
     BindNotLoopback(SocketAddr),
+    #[error("failed to prepare data directory {path}: {source}")]
+    DataDir {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }

@@ -544,6 +544,19 @@ impl ModelProvisioner for FakeProvisioner {
 }
 
 #[test]
+fn policy_scope_serde_uses_snake_case_shapes() {
+    let global = serde_json::to_value(PolicyScope::Global).unwrap();
+    assert_eq!(global, serde_json::json!("global"));
+    let profile = serde_json::to_value(PolicyScope::Profile("team-a".into())).unwrap();
+    assert_eq!(profile, serde_json::json!({"profile": "team-a"}));
+    let parsed: PolicyScope = serde_json::from_value(serde_json::json!("global")).unwrap();
+    assert_eq!(parsed, PolicyScope::Global);
+    let parsed: PolicyScope =
+        serde_json::from_value(serde_json::json!({"profile": "team-a"})).unwrap();
+    assert_eq!(parsed, PolicyScope::Profile("team-a".into()));
+}
+
+#[test]
 fn fake_provisioner_ensure_returns_configured_path_without_network() {
     let fake = FakeProvisioner {
         path: PathBuf::from("/models/fake-bundle"),

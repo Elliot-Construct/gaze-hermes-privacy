@@ -2,14 +2,17 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::Arc;
 
 use clap::Parser;
 use tracing::info;
 
-use gaze_hermes_sidecar::api::build_router;
+use gaze_hermes_sidecar::api::{build_router, AppState, Metrics};
 use gaze_hermes_sidecar::auth::AuthState;
 use gaze_hermes_sidecar::config::Config;
+use gaze_hermes_sidecar::policies::PolicyStore;
 use gaze_hermes_sidecar::protocol::PROTOCOL_VERSION;
+use gaze_hermes_sidecar::sessions::SessionRegistry;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -25,6 +28,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let token = config.load_token()?;
     let auth = AuthState::new(&token);
 
+    let data_dir = config.bootstrap_data_dir()?;
+    let policies = Arc::new(PolicyStore::open(&data_dir.join("policies"))?);
+    let sessions = Arc::new(SessionRegistry::open(&data_dir.join("sessions"))?);
+    let state = AppState::new(auth, policies, sessions, Arc::new(Metrics::default()));
+
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     let local_addr: SocketAddr = listener.local_addr()?;
 
@@ -33,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     info!(%local_addr, "gaze sidecar listening");
-    let app = build_router(auth);
+    let app = build_router(state);
     axum::serve(listener, app).await?;
     Ok(())
 }

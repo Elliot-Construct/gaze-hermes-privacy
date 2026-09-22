@@ -47,6 +47,22 @@ pub struct ValidationResult {
     pub errors: Vec<String>,
 }
 
+impl ValidationResult {
+    pub fn ok() -> Self {
+        Self {
+            ok: true,
+            errors: Vec::new(),
+        }
+    }
+
+    pub fn from_error(err: impl std::fmt::Display) -> Self {
+        Self {
+            ok: false,
+            errors: vec![err.to_string()],
+        }
+    }
+}
+
 struct StoreData {
     global: String,
     profiles: BTreeMap<String, String>,
@@ -163,10 +179,7 @@ impl PolicyStore {
             match merge_policy_documents(&global, raw_toml) {
                 Ok(merged) => merged,
                 Err(err) => {
-                    return ValidationResult {
-                        ok: false,
-                        errors: vec![err.to_string()],
-                    };
+                    return ValidationResult::from_error(err);
                 }
             }
         } else {
@@ -174,14 +187,8 @@ impl PolicyStore {
         };
 
         match self.try_build(&candidate) {
-            Ok(_) => ValidationResult {
-                ok: true,
-                errors: Vec::new(),
-            },
-            Err(err) => ValidationResult {
-                ok: false,
-                errors: vec![err.to_string()],
-            },
+            Ok(_) => ValidationResult::ok(),
+            Err(err) => ValidationResult::from_error(err),
         }
     }
 
@@ -396,7 +403,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn validate_profile_id(id: &str) -> Result<(), PolicyStoreError> {
+pub fn validate_profile_id(id: &str) -> Result<(), PolicyStoreError> {
     if id.is_empty()
         || id.contains('/')
         || id.contains('\\')
@@ -406,6 +413,10 @@ fn validate_profile_id(id: &str) -> Result<(), PolicyStoreError> {
         return Err(PolicyStoreError::InvalidProfileId(id.to_string()));
     }
     Ok(())
+}
+
+pub fn validate_profile_id_public(id: &str) -> Result<(), PolicyStoreError> {
+    validate_profile_id(id)
 }
 
 fn is_overlay_document(raw: &str) -> bool {
