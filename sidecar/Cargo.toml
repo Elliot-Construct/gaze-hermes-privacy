@@ -23,6 +23,11 @@ gaze-model-setup = "=0.14.0"
 toml = "0.9"
 toml_edit = "0.23"
 sha2 = "0.10"
+chacha20poly1305 = "0.10"
+rand = { version = "0.9", features = ["os_rng"] }
+hex = "0.4"
+zeroize = "1.8"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
