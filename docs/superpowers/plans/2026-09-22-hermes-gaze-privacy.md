@@ -1,0 +1,1757 @@
+# Hermes Gaze Privacy Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Build a standalone open-source Hermes plugin that reversibly pseudonymises PII before external LLM calls, restores responses locally before Hermes parses them, preserves live streaming, and exposes a native Hermes Desktop privacy console.
+
+**Architecture:** A root-level Hermes Python plugin owns provider trust, request/response adaptation, fail-closed middleware integration, and lifecycle management for a native Rust sidecar. The sidecar embeds Gaze 0.14.x crates, owns reversible mappings and encrypted snapshots, exposes authenticated loopback REST/WebSocket APIs, and never routes LLM traffic itself. A single uncompiled Hermes Desktop `desktop/plugin.js` talks only to the Python plugin's `/api/plugins/gaze-hermes-privacy` namespace.
+
+**Tech Stack:** Python 3.11+, Hermes Agent plugin/middleware APIs, Rust 1.89+, Gaze 0.14.0 crates, Axum/Tokio WebSockets, ChaCha20-Poly1305, TOML/toml_edit, pytest, cargo test, Hermes Desktop plugin SDK, GitHub Actions, Docker.
+
+**Spec:** `docs/superpowers/specs/2026-09-22-hermes-gaze-privacy-design.md`
+
+## Global Constraints
+
+- The project is open-source and vendor-neutral; no DataWyse-specific branding, policies, paths, or assumptions.
+- No permanent Hermes fork.
+- External providers are protected by default; only explicitly allowlisted trusted-local providers bypass Gaze.
+- No automatic trust inference from localhost, loopback IPs, Ollama, vLLM, provider names, or network placement.
+- Hermes remains responsible for provider credentials, model selection, routing, retries, and fallbacks.
+- The default install path requires neither Docker, a Rust compiler, nor a separate Gaze installation.
+- Native sidecar API binds to `127.0.0.1:65113` by default and requires bearer authentication.
+- Streaming restoration is required in v1.
+- Active mappings are in memory; restart recovery uses encrypted persisted snapshots.
+- Production secrets come from secret files where configured; secure generated-and-persisted fallbacks are allowed.
+- Gaze NER assets are pinned and checksum-verified; manual/offline provisioning is supported.
+- TOML is the canonical policy source; effective policy is global base plus optional per-profile overrides.
+- The Desktop renderer never receives the sidecar bearer secret or snapshot encryption key.
+- Raw PII is absent from ordinary logs and persisted debug events.
+- Unsupported opaque, binary, image, audio, or unknown provider payload carriers block external transmission in mandatory mode.
+- Mandatory mode blocks external providers when required fail-closed Hermes capabilities are unavailable.
+- Gaze dependencies are pinned to `0.14.0` for the first implementation pass; upgrade only through an explicit compatibility change.
+- Rust minimum version is `1.89`, matching Gaze 0.14.0.
+
+## Review Focus
+
+1. **Unknown provider payload carriers:** a request containing an unrecognised opaque/binary/multimodal field must block in mandatory mode rather than forward bytes that were not inspected. Task 9 adds the contract tests.
+2. **Streaming token boundaries across lanes:** a Gaze token split across chunks, including interleaved text/reasoning lanes, must restore correctly without concatenating lane state or emitting partial token syntax. Task 7 adds the state-machine tests.
+3. **Crash/corruption during snapshot persistence:** an interrupted atomic write, wrong key, tampered ciphertext, or stale temporary file must never replace a valid recoverable session. Task 5 adds the persistence tests.
+4. **Provider fallback trust changes:** fallback from trusted-local to external must re-enter protection, while fallback from one external provider to another must not reuse provider trust. Task 10 adds the end-to-end middleware tests.
+5. **Sensitive debug reveal lifecycle:** revealed payloads must disappear on timeout, profile change, pane unmount, and disconnect, and must never enter normal event persistence. Tasks 11 and 13 add backend and Desktop tests.
+
+---
+
+### Task 1: Upstream Hermes security middleware contract
+
+**Files in upstream `NousResearch/hermes-agent`:**
+- Modify: `hermes_cli/plugins.py`
+- Modify: `hermes_cli/plugins_dispatch.py`
+- Modify: `hermes_cli/middleware.py`
+- Modify: `agent/stream_delivery.py`
+- Modify: `tests/hermes_cli/test_plugins.py`
+- Modify: `tests/agent/test_plugin_stream_hooks.py`
+- Modify: `website/docs/developer-guide/middleware.md`
+- Modify: `website/docs/developer-guide/plugins/index.md`
+
+**Files in this repository:**
+- Modify: GitHub Issue #1 description to include the stream-transform requirement
+- Create: `docs/upstream-hermes.md`
+
+**Interfaces:**
+- Consumes: current Hermes `PluginContext.register_middleware(kind, callback)`, `run_llm_execution_middleware(...)`, and stream delivery methods.
+- Produces: `PluginContext.register_middleware(kind, callback, *, failure_mode="open")` with `failure_mode in {"open","closed"}`; new middleware kind `llm_stream_text`; `apply_llm_stream_text_middleware(text: str, *, kind: str, **context) -> str`; additive `api_request_id` in stream context.
+
+- [ ] **Step 1: Write failing fail-closed execution tests**
+
+Add tests proving both pre- and post-`next_call` callback failures propagate when registered closed, while existing middleware remains fail-open:
+
+```python
+def test_llm_execution_failure_mode_closed_never_falls_through(monkeypatch):
+    from hermes_cli.middleware import run_llm_execution_middleware
+    from hermes_cli.plugins import get_plugin_manager
+
+    manager = get_plugin_manager()
+    provider_called = False
+
+    def privacy_middleware(*, next_call, **_kwargs):
+        raise RuntimeError("privacy unavailable")
+
+    manager._middleware.setdefault("llm_execution", []).append(privacy_middleware)
+    manager._middleware_failure_modes[("llm_execution", id(privacy_middleware))] = "closed"
+
+    def provider(_request):
+        nonlocal provider_called
+        provider_called = True
+        return {"ok": True}
+
+    with pytest.raises(RuntimeError, match="privacy unavailable"):
+        run_llm_execution_middleware({"messages": []}, provider)
+
+    assert provider_called is False
+
+
+def test_closed_middleware_failure_after_next_call_does_not_return_unrestored_result():
+    from hermes_cli.middleware import run_llm_execution_middleware
+    from hermes_cli.plugins import get_plugin_manager
+
+    manager = get_plugin_manager()
+
+    def privacy_middleware(*, next_call, request, **_kwargs):
+        next_call(request)
+        raise RuntimeError("restore failed")
+
+    manager._middleware.setdefault("llm_execution", []).append(privacy_middleware)
+    manager._middleware_failure_modes[("llm_execution", id(privacy_middleware))] = "closed"
+
+    with pytest.raises(RuntimeError, match="restore failed"):
+        run_llm_execution_middleware({"messages": []}, lambda _request: {"content": "<token>"})
+```
+
+- [ ] **Step 2: Run the focused tests and verify they fail**
+
+Run:
+
+```bash
+pytest tests/hermes_cli/test_plugins.py -k "failure_mode_closed or closed_middleware_failure_after_next_call" -v
+```
+
+Expected: FAIL because `_middleware_failure_modes` and closed-mode handling do not exist.
+
+- [ ] **Step 3: Add explicit middleware failure metadata**
+
+Keep `_middleware` as the existing callback list for compatibility and add a side-table keyed by `(kind, id(callback))`. Validate the registration option:
+
+```python
+VALID_MIDDLEWARE_FAILURE_MODES = frozenset({"open", "closed"})
+
+def register_middleware(
+    self,
+    kind: str,
+    callback: Callable,
+    *,
+    failure_mode: str = "open",
+) -> None:
+    if failure_mode not in VALID_MIDDLEWARE_FAILURE_MODES:
+        raise ValueError(f"unsupported middleware failure_mode: {failure_mode!r}")
+    self._manager.register_middleware(
+        self.plugin_id,
+        kind,
+        callback,
+        failure_mode=failure_mode,
+    )
+```
+
+Manager registration must store and remove the mode when the plugin unloads. `_run_execution_chain` must re-raise the middleware callback's own exception when its mode is `closed`, including after `next_call()` succeeded. Downstream exceptions continue to propagate unchanged through `_DownstreamExecutionError`.
+
+- [ ] **Step 4: Re-run fail-closed tests and existing middleware tests**
+
+Run:
+
+```bash
+pytest tests/hermes_cli/test_plugins.py tests/hermes_cli/test_plugin_hook_failure_reporting.py -v
+```
+
+Expected: PASS, including legacy fail-open tests.
+
+- [ ] **Step 5: Write failing synchronous stream-transform tests**
+
+Add `llm_stream_text` as a middleware kind and test that it transforms before the UI callback and that closed failures abort delivery:
+
+```python
+def test_stream_text_middleware_transforms_before_display(monkeypatch):
+    agent = _agent()
+    displayed = []
+    agent.stream_delta_callback = displayed.append
+    agent._current_api_request_id = "turn-1:api:1"
+
+    monkeypatch.setattr(
+        "hermes_cli.middleware.apply_llm_stream_text_middleware",
+        lambda text, **ctx: "Jane" if text == "<Name_1>" else text,
+    )
+
+    agent._fire_stream_delta("<Name_1>")
+
+    assert displayed == ["Jane"]
+
+
+def test_stream_text_closed_failure_reaches_stream_caller(monkeypatch):
+    agent = _agent()
+    agent.stream_delta_callback = lambda _text: None
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("stream restore failed")
+
+    monkeypatch.setattr("hermes_cli.middleware.apply_llm_stream_text_middleware", fail)
+
+    with pytest.raises(RuntimeError, match="stream restore failed"):
+        agent._fire_stream_delta("<Name")
+```
+
+Add equivalent coverage for reasoning and interim commentary.
+
+- [ ] **Step 6: Implement `llm_stream_text`**
+
+In `hermes_cli/middleware.py`:
+
+```python
+LLM_STREAM_TEXT_MIDDLEWARE = "llm_stream_text"
+VALID_MIDDLEWARE.add(LLM_STREAM_TEXT_MIDDLEWARE)
+
+def apply_llm_stream_text_middleware(text: str, *, kind: str, **context: Any) -> str:
+    from hermes_cli.plugins import get_plugin_manager
+
+    manager = get_plugin_manager()
+    current = text
+    for callback in list(manager._middleware.get(LLM_STREAM_TEXT_MIDDLEWARE, [])):
+        payload = middleware_payload(text=current, kind=kind, **context)
+        try:
+            result = callback(**payload)
+        except Exception as exc:
+            manager._report_hook_failure(
+                LLM_STREAM_TEXT_MIDDLEWARE, callback, payload, exc, surface="Middleware"
+            )
+            if manager.middleware_failure_mode(LLM_STREAM_TEXT_MIDDLEWARE, callback) == "closed":
+                raise
+            continue
+        if isinstance(result, dict) and isinstance(result.get("text"), str):
+            current = result["text"]
+    return current
+```
+
+In `agent/stream_delivery.py`, add `api_request_id` to `_stream_hook_base_payload()`, then call the transform synchronously before delivering text, reasoning, and completed interim commentary:
+
+```python
+text = apply_llm_stream_text_middleware(
+    text,
+    kind="text",
+    **self._stream_hook_base_payload(),
+)
+```
+
+Use `kind="reasoning"` and `kind="interim"` on those paths. Returning `""` is valid so a privacy middleware may buffer a partial protected token.
+
+- [ ] **Step 7: Run streaming regression tests**
+
+Run:
+
+```bash
+pytest tests/agent/test_plugin_stream_hooks.py tests/agent/test_streaming.py tests/agent/test_stream_single_writer.py -v
+```
+
+Expected: PASS. Existing asynchronous observer hooks remain observers; the new synchronous middleware is the only transform path.
+
+- [ ] **Step 8: Document and submit the upstream change**
+
+Document that closed middleware is for security boundaries, and that `llm_stream_text` is synchronous because transformed bytes must precede display/TTS. Update this repository's Issue #1 to note both required upstream capabilities and record the upstream PR URL in `docs/upstream-hermes.md`.
+
+- [ ] **Step 9: Commit upstream and documentation changes**
+
+In the Hermes worktree:
+
+```bash
+git add hermes_cli/plugins.py hermes_cli/plugins_dispatch.py hermes_cli/middleware.py agent/stream_delivery.py tests/hermes_cli/test_plugins.py tests/agent/test_plugin_stream_hooks.py website/docs/developer-guide/middleware.md website/docs/developer-guide/plugins/index.md
+git commit -m "feat: add fail-closed and stream text middleware"
+```
+
+In this repository:
+
+```bash
+git add docs/upstream-hermes.md
+git commit -m "docs: track required Hermes privacy middleware"
+```
+
+---
+
+### Task 2: Root Hermes plugin scaffold, configuration, and provider trust policy
+
+**Files:**
+- Create: `plugin.yaml`
+- Create: `__init__.py`
+- Create: `gaze_privacy/__init__.py`
+- Create: `gaze_privacy/errors.py`
+- Create: `gaze_privacy/config.py`
+- Create: `gaze_privacy/provider_policy.py`
+- Create: `tests/python/test_config.py`
+- Create: `tests/python/test_provider_policy.py`
+- Create: `pyproject.toml`
+
+**Interfaces:**
+- Consumes: Hermes plugin loader and host configuration/environment.
+- Produces: `PrivacyConfig.load() -> PrivacyConfig`; `ProviderPolicy.classify(provider_id: str) -> ProtectionDecision`; `PrivacyBlockedError`.
+
+- [ ] **Step 1: Write configuration and trust-policy tests**
+
+```python
+def test_external_provider_is_protected_by_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("GAZE_HERMES_HOME", str(tmp_path))
+    cfg = PrivacyConfig.load()
+    policy = ProviderPolicy(cfg.trusted_local_providers)
+    assert policy.classify("openrouter") == ProtectionDecision.PROTECT
+
+
+def test_only_explicit_provider_id_bypasses(tmp_path, monkeypatch):
+    monkeypatch.setenv("GAZE_HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.toml").write_text(
+        '[providers]\ntrusted_local = ["local-vllm"]\n',
+        encoding="utf-8",
+    )
+    cfg = PrivacyConfig.load()
+    policy = ProviderPolicy(cfg.trusted_local_providers)
+    assert policy.classify("local-vllm") == ProtectionDecision.BYPASS
+    assert policy.classify("ollama") == ProtectionDecision.PROTECT
+    assert policy.classify("http://127.0.0.1:11434") == ProtectionDecision.PROTECT
+```
+
+- [ ] **Step 2: Run tests and verify failure**
+
+Run:
+
+```bash
+pytest tests/python/test_config.py tests/python/test_provider_policy.py -v
+```
+
+Expected: FAIL because the package does not exist.
+
+- [ ] **Step 3: Add plugin metadata and typed configuration**
+
+Use a root plugin layout because Hermes hybrid-repo detection requires root `plugin.yaml` + `__init__.py`, with Desktop at `desktop/plugin.js`.
+
+Core types:
+
+```python
+from dataclasses import dataclass
+from enum import StrEnum
+
+class ProtectionDecision(StrEnum):
+    PROTECT = "protect"
+    BYPASS = "bypass"
+
+@dataclass(frozen=True)
+class PrivacyConfig:
+    home: Path
+    sidecar_mode: str
+    sidecar_url: str
+    trusted_local_providers: frozenset[str]
+    mandatory_mode: bool
+    api_token_file: Path
+    master_key_file: Path
+    global_policy_file: Path
+    profile_policy_dir: Path
+
+    @classmethod
+    def load(cls) -> "PrivacyConfig":
+        ...
+```
+
+The implementation must use `GAZE_HERMES_HOME` when set; otherwise resolve the host-wide Hermes root and append `gaze-hermes-privacy`. Default `sidecar_mode` is `"native"`, default URL is `http://127.0.0.1:65113`, and `mandatory_mode` defaults true.
+
+- [ ] **Step 4: Implement exact-match provider policy**
+
+```python
+class ProviderPolicy:
+    def __init__(self, trusted_local_providers: frozenset[str]):
+        self._trusted = trusted_local_providers
+
+    def classify(self, provider_id: str) -> ProtectionDecision:
+        return (
+            ProtectionDecision.BYPASS
+            if provider_id in self._trusted
+            else ProtectionDecision.PROTECT
+        )
+```
+
+Do not inspect URL, hostname, provider display label, or process location.
+
+- [ ] **Step 5: Run tests**
+
+Run:
+
+```bash
+pytest tests/python/test_config.py tests/python/test_provider_policy.py -v
+```
+
+Expected: PASS.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add plugin.yaml __init__.py gaze_privacy pyproject.toml tests/python
+git commit -m "feat: scaffold Hermes privacy plugin"
+```
+
+---
+
+### Task 3: Rust sidecar process, authenticated loopback API, and protocol handshake
+
+**Files:**
+- Create: `sidecar/Cargo.toml`
+- Create: `sidecar/src/main.rs`
+- Create: `sidecar/src/config.rs`
+- Create: `sidecar/src/auth.rs`
+- Create: `sidecar/src/api/mod.rs`
+- Create: `sidecar/src/api/status.rs`
+- Create: `sidecar/src/protocol.rs`
+- Create: `sidecar/tests/health_auth.rs`
+
+**Interfaces:**
+- Consumes: API token file and process configuration.
+- Produces: sidecar process on `127.0.0.1:65113`; `GET /healthz`; authenticated `GET /v1/status`; protocol version `1`.
+
+- [ ] **Step 1: Write failing router/auth tests**
+
+```rust
+#[tokio::test]
+async fn status_requires_bearer_token() {
+    let app = test_app("secret-token").await;
+    let response = app.oneshot(
+        Request::builder().uri("/v1/status").body(Body::empty()).unwrap()
+    ).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn health_is_minimal_and_protocol_is_explicit() {
+    let app = test_app("secret-token").await;
+    let response = app.oneshot(
+        Request::builder().uri("/healthz").body(Body::empty()).unwrap()
+    ).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["protocol_version"], 1);
+    assert!(body.get("sessions").is_none());
+}
+```
+
+- [ ] **Step 2: Add pinned Rust dependencies**
+
+`sidecar/Cargo.toml` must set `rust-version = "1.89"` and include:
+
+```toml
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive", "env"] }
+thiserror = "2"
+subtle = "2.6"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+```
+
+- [ ] **Step 3: Run tests and verify failure**
+
+Run:
+
+```bash
+cargo test --manifest-path sidecar/Cargo.toml --test health_auth
+```
+
+Expected: FAIL because router/config modules are absent.
+
+- [ ] **Step 4: Implement config, constant-time bearer auth, and status**
+
+Use `127.0.0.1:65113` as the default bind. Read the bearer token from `--api-token-file`; reject an empty/missing file. Compare equal-length byte strings using `subtle::ConstantTimeEq`.
+
+Status contract:
+
+```rust
+#[derive(Serialize)]
+pub struct StatusResponse {
+    pub status: &'static str,
+    pub protocol_version: u32,
+    pub sidecar_version: &'static str,
+}
+pub const PROTOCOL_VERSION: u32 = 1;
+```
+
+- [ ] **Step 5: Run tests**
+
+Run:
+
+```bash
+cargo test --manifest-path sidecar/Cargo.toml --test health_auth
+```
+
+Expected: PASS.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add sidecar
+git commit -m "feat: add authenticated Gaze sidecar shell"
+```
+
+---
+
+### Task 4: Gaze policy engine, profile overrides, and verified NER provisioning
+
+**Files:**
+- Modify: `sidecar/Cargo.toml`
+- Create: `sidecar/src/policies/mod.rs`
+- Create: `sidecar/src/policies/merge.rs`
+- Create: `sidecar/src/policies/editor.rs`
+- Create: `sidecar/src/model.rs`
+- Create: `sidecar/tests/policies.rs`
+- Create: `policies/default.toml`
+- Create: `policies/strict.toml`
+- Create: `policies/examples/custom-identifiers.toml`
+- Create: `docs/policies.md`
+
+**Interfaces:**
+- Consumes: full global Gaze TOML policy plus optional profile override TOML.
+- Produces: `PolicyStore::effective(profile_id) -> EffectivePolicy`; `PolicyStore::validate(raw_toml) -> ValidationResult`; `ModelProvisioner::ensure() -> PathBuf`.
+
+- [ ] **Step 1: Add exact Gaze dependencies**
+
+```toml
+gaze = { package = "gaze-pii", version = "=0.14.0" }
+gaze-assembly = "=0.14.0"
+gaze-recognizers = "=0.14.0"
+gaze-model-setup = "=0.14.0"
+toml = "0.9"
+toml_edit = "0.23"
+sha2 = "0.10"
+```
+
+- [ ] **Step 2: Write policy merge and validation tests**
+
+Define profile override identity rules explicitly:
+
+- recognisers are keyed by `name`;
+- class rules are keyed by `class:<class>`;
+- column rules are keyed by `column:<column>`;
+- profile replacements override matching global entries;
+- profile `remove_recognizers` and `remove_rules` delete inherited entries;
+- unrelated/advanced global TOML is preserved.
+
+Example test:
+
+```rust
+#[test]
+fn profile_override_replaces_one_rule_without_flattening_base() {
+    let base = r#"
+schema_version = "0.1.0"
+[[rule]]
+kind = "class"
+class = "email"
+action = "tokenize"
+[[rule]]
+kind = "class"
+class = "name"
+action = "tokenize"
+"#;
+    let overlay = r#"
+schema_version = "gaze-hermes-profile-1"
+[[overrides.rules]]
+kind = "class"
+class = "email"
+action = "redact"
+"#;
+
+    let effective = merge_policy_documents(base, overlay).unwrap();
+    assert!(effective.contains("class = \"email\""));
+    assert!(effective.contains("action = \"redact\""));
+    assert!(effective.contains("class = \"name\""));
+}
+```
+
+- [ ] **Step 3: Run tests and verify failure**
+
+Run:
+
+```bash
+cargo test --manifest-path sidecar/Cargo.toml --test policies
+```
+
+Expected: FAIL because policy modules are absent.
+
+- [ ] **Step 4: Implement effective-policy assembly**
+
+Load effective TOML into `gaze::Policy`, load embedded rulepacks requested by policy, construct `gaze::Context`, resolve `LocaleChain`, and call the current Gaze assembly API:
+
+```rust
+let policy = gaze::Policy::load(&effective_path)?;
+let context = gaze::Context {
+    dictionaries: HashMap::new(),
+    class_map: HashMap::new(),
+    fields: Default::default(),
+};
+let pipeline = gaze_assembly::build_pipeline(
+    &policy,
+    &context,
+    &rulepacks,
+    &active_locales,
+    None,
+)?;
+```
+
+Production code must build from the merged effective document, not from a hard-coded fallback pipeline.
+
+- [ ] **Step 5: Implement a preserving visual-editor patch layer**
+
+Use `toml_edit::DocumentMut` so visual operations edit only supported recogniser/rule nodes. Unknown keys and advanced-only nodes remain byte-preserving where `toml_edit` permits.
+
+Expose internal operations:
+
+```rust
+pub enum PolicyEdit {
+    UpsertRule(RuleEdit),
+    RemoveRule { identity: String },
+    UpsertRecognizer(RecognizerEdit),
+    RemoveRecognizer { name: String },
+}
+```
+
+- [ ] **Step 6: Implement NER model provisioning behind a trait**
+
+Production implementation calls Gaze's pinned installer:
+
+```rust
+pub trait ModelProvisioner: Send + Sync {
+    fn ensure(&self) -> Result<PathBuf, ModelError>;
+}
+
+pub struct GazeModelProvisioner {
+    pub model_dir: Option<PathBuf>,
+}
+
+impl ModelProvisioner for GazeModelProvisioner {
+    fn ensure(&self) -> Result<PathBuf, ModelError> {
+        let outcome = gaze_model_setup::install_ner_bundle(self.model_dir.as_deref())?;
+        Ok(outcome.model_dir)
+    }
+}
+```
+
+Unit tests use a fake provisioner and never perform network downloads.
+
+- [ ] **Step 7: Add open-source default policies**
+
+`policies/default.toml` must use Gaze schema `0.1.0`, bundled common PII rulepacks, reversible `tokenize` actions, conversation scope, and no organisation-specific classes. `strict.toml` may add a protective default action and stricter rulepack selection, but must remain restorable where the spec requires restoration.
+
+- [ ] **Step 8: Run tests**
+
+Run:
+
+```bash
+cargo test --manifest-path sidecar/Cargo.toml --test policies
+```
+
+Expected: PASS.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add sidecar/Cargo.toml sidecar/src/policies sidecar/src/model.rs sidecar/tests/policies.rs policies docs/policies.md
+git commit -m "feat: add Gaze policy and model runtime"
+```
+
+---
+
+### Task 5: Session registry and encrypted atomic snapshots
+
+**Files:**
+- Modify: `sidecar/Cargo.toml`
+- Create: `sidecar/src/sessions/mod.rs`
+- Create: `sidecar/src/sessions/store.rs`
+- Create: `sidecar/src/crypto.rs`
+- Create: `sidecar/tests/session_store.rs`
+
+**Interfaces:**
+- Consumes: `Namespace { profile_id, session_id }`, master-key file, Gaze `Session::export/import`.
+- Produces: `SessionRegistry::get_or_restore(&Namespace) -> Arc<SessionHandle>`; `SessionRegistry::persist(&Namespace)`; `SessionRegistry::delete(&Namespace)`.
+
+- [ ] **Step 1: Add encryption dependencies and write failure tests**
+
+```toml
+chacha20poly1305 = "0.10"
+rand = "0.9"
+hex = "0.4"
+zeroize = "1.8"
+```
+
+Tests must cover:
+- round-trip restore;
+- wrong key;
+- ciphertext tamper;
+- stale `.tmp` file next to a valid snapshot;
+- simulated failure before rename;
+- profile/session namespace separation.
+
+```rust
+#[test]
+fn tampered_snapshot_never_replaces_live_session() {
+    let fixture = SnapshotFixture::new();
+    fixture.persist("profile-a", "session-1", "alice@example.invalid");
+    fixture.flip_ciphertext_byte("profile-a", "session-1");
+    let err = fixture.restore("profile-a", "session-1").unwrap_err();
+    assert!(matches!(err, StoreError::Decrypt | StoreError::Integrity));
+}
+```
+
+- [ ] **Step 2: Run tests and verify failure**
+
+Run:
+
+```bash
+cargo test --manifest-path sidecar/Cargo.toml --test session_store
+```
+
+Expected: FAIL because registry/store do not exist.
+
+- [ ] **Step 3: Implement snapshot envelope based on Gaze's proven pattern**
+
+Use:
+- ChaCha20-Poly1305;
+- random 12-byte nonce;
+- AAD containing protocol version plus canonical `profile_id/session_id`;
+- a fixed magic/version header;
+- SHA-256 of the namespace for the filename;
+- `Session::export()` as plaintext before encryption;
+- `Session::import(SensitiveSnapshot::from(...))` after decryption.
+
+Never write plaintext snapshot bytes to disk.
+
+- [ ] **Step 4: Implement atomic persistence**
+
+Write to a sibling temporary file, `sync_all()`, then atomic rename. A stale temp file is ignored on read and may be cleaned on startup. The existing `.enc` remains authoritative until rename succeeds.
+
+- [ ] **Step 5: Implement recovery refusal**
+
+If an encrypted snapshot exists but cannot decrypt/import, return a typed recovery error. Do not create a new session with the same namespace until the operator explicitly resets/deletes the broken snapshot.
+
+- [ ] **Step 6: Run tests**
+
+Run:
+
+```bash
+cargo test --manifest-path sidecar/Cargo.toml --test session_store
+```
+
+Expected: PASS.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add sidecar/Cargo.toml sidecar/src/sessions sidecar/src/crypto.rs sidecar/tests/session_store.rs
+git commit -m "feat: persist encrypted Gaze sessions"
+```
+
+---
+
+### Task 6: Transactional clean/restore REST API
+
+**Files:**
+- Create: `sidecar/src/api/privacy.rs`
+- Modify: `sidecar/src/api/mod.rs`
+- Modify: `sidecar/src/sessions/mod.rs`
+- Create: `sidecar/tests/privacy_api.rs`
+
+**Interfaces:**
+- Consumes: `PolicyStore`, `SessionRegistry`.
+- Produces:
+  - `POST /v1/clean`
+  - `POST /v1/restore`
+  - canonical `Namespace`, `TextField`, `CleanRequest/Response`, `RestoreRequest/Response`.
+
+- [ ] **Step 1: Define canonical field protocol and write failing tests**
+
+```rust
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Namespace {
+    pub profile_id: String,
+    pub session_id: String,
+    pub request_id: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct TextField {
+    pub path: String,
+    pub text: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct CleanRequest {
+    pub namespace: Namespace,
+    pub fields: Vec<TextField>,
+}
+```
+
+A multi-field clean must be atomic: if field 3 fails, mappings staged by fields 1 and 2 are not committed.
+
+- [ ] **Step 2: Run tests and verify failure**
+
+Run:
+
+```bash
+cargo test --manifest-path sidecar/Cargo.toml --test privacy_api
+```
+
+Expected: FAIL because the routes are absent.
+
+- [ ] **Step 3: Implement one Gaze transaction across all outbound fields**
+
+```rust
+let handle = registry.get_or_restore(&request.namespace).await?;
+let mut tx = handle.session.begin_transaction();
+let mut cleaned = Vec::with_capacity(request.fields.len());
+
+for field in &request.fields {
+    let text = pipeline.protect_text_transaction(
+        &mut tx,
+        &field.text,
+        protection_context,
+    )?;
+    cleaned.push(TextField { path: field.path.clone(), text });
+}
+
+tx.commit()?;
+registry.persist(&request.namespace).await?;
+```
+
+Only commit after all fields succeed.
+
+- [ ] **Step 4: Implement strict restore**
+
+Restore every field with `Session::restore_strict_text`. Unknown/malformed owned-token syntax becomes a typed 422 privacy error, never a pass-through success.
+
+- [ ] **Step 5: Return sanitised detection summaries**
+
+Responses may include class/count metadata but never raw mappings:
+
+```json
+{
+  "fields": [{"path": "/messages/0/content", "text": "Contact <token>"}],
+  "detections": [{"class": "email", "count": 1}],
+  "policy_version": "sha256:..."
+}
+```
+
+- [ ] **Step 6: Run tests**
+
+Run:
+
+```bash
+cargo test --manifest-path sidecar/Cargo.toml --test privacy_api
+```
+
+Expected: PASS.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add sidecar/src/api sidecar/src/sessions/mod.rs sidecar/tests/privacy_api.rs
+git commit -m "feat: add transactional privacy API"
+```
+
+---
+
+### Task 7: Stateful WebSocket stream restoration
+
+**Files:**
+- Create: `sidecar/src/streaming/mod.rs`
+- Create: `sidecar/src/streaming/restorer.rs`
+- Create: `sidecar/src/api/streams.rs`
+- Modify: `sidecar/src/api/mod.rs`
+- Create: `sidecar/tests/streaming.rs`
+
+**Interfaces:**
+- Consumes: authenticated WebSocket, session namespace, Gaze strict restore.
+- Produces: `WS /v1/streams/{stream_id}` with `open/chunk/finish/abort`; per-lane carry buffer; strict global sequence checking.
+
+- [ ] **Step 1: Write state-machine tests for split tokens and lanes**
+
+Use a session that maps one real value to one actual Gaze token generated by Task 6; do not hard-code a guessed token grammar.
+
+Test:
+- token split at every byte boundary;
+- two tokens in one chunk;
+- text/reasoning lane interleaving;
+- duplicate sequence;
+- skipped sequence;
+- finish with incomplete reserved token prefix;
+- abort removes stream state.
+
+```rust
+#[test]
+fn split_token_is_never_emitted_partially() {
+    let (session, token) = fixture_session_with_email("alice@example.invalid");
+    for split in 1..token.len() {
+        let mut r = StreamRestorer::new(session.clone());
+        assert_eq!(r.feed(1, "text", &token[..split]).unwrap(), "");
+        assert_eq!(
+            r.feed(2, "text", &token[split..]).unwrap(),
+            "alice@example.invalid"
+        );
+    }
+}
+```
+
+- [ ] **Step 2: Run tests and verify failure**
+
+Run:
+
+```bash
+cargo test --manifest-path sidecar/Cargo.toml --test streaming
+```
+
+Expected: FAIL because the stream restorer does not exist.
+
+- [ ] **Step 3: Implement per-lane carry buffering**
+
+Maintain:
+- one monotonically increasing message sequence for the WebSocket;
+- independent carry buffers keyed by `kind` (`text`, `reasoning`, `interim`);
+- a maximum carry length derived from Gaze token grammar plus a small guard margin.
+
+The restorer may return an empty string while it holds a possible token prefix. It must never carry text from one lane into another.
+
+- [ ] **Step 4: Implement strict WebSocket protocol**
+
+Messages:
+
+```json
+{"type":"open","namespace":{"profile_id":"default","session_id":"s1","request_id":"r1"}}
+{"type":"chunk","seq":1,"kind":"text","text":"Hello <partial"}
+{"type":"chunk","seq":2,"kind":"text","text":" token>"}
+{"type":"finish"}
+```
+
+Server replies to each chunk with the same sequence and restored text. `finish` succeeds only when every lane buffer is empty/non-token text; a dangling protected-token prefix fails the stream.
+
+- [ ] **Step 5: Run tests**
+
+Run:
+
+```bash
+cargo test --manifest-path sidecar/Cargo.toml --test streaming
+```
+
+Expected: PASS.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add sidecar/src/streaming sidecar/src/api/streams.rs sidecar/src/api/mod.rs sidecar/tests/streaming.rs
+git commit -m "feat: restore protected streams over WebSocket"
+```
+
+---
+
+### Task 8: Python sidecar client, secure bootstrap, and native-first lifecycle manager
+
+**Files:**
+- Create: `gaze_privacy/sidecar_client.py`
+- Create: `gaze_privacy/sidecar_manager.py`
+- Create: `gaze_privacy/secrets.py`
+- Create: `gaze_privacy/release_manifest.py`
+- Create: `sidecar-release.json`
+- Create: `tests/python/test_sidecar_client.py`
+- Create: `tests/python/test_sidecar_manager.py`
+- Create: `tests/python/test_secrets.py`
+
+**Interfaces:**
+- Consumes: `PrivacyConfig`, release manifest, sidecar REST/WebSocket protocol.
+- Produces: `SidecarManager.ensure_running() -> SidecarStatus`; `SidecarClient.clean/restore/open_stream`; generated secret files with restrictive permissions.
+
+- [ ] **Step 1: Write secret/bootstrap tests**
+
+Tests must prove:
+- existing operator-supplied secret files are never overwritten;
+- generated secrets are random and persistent across reloads;
+- POSIX permissions are `0o600`;
+- a binary with wrong SHA-256 is deleted/refused;
+- Docker/external mode never attempts a native download.
+
+- [ ] **Step 2: Run tests and verify failure**
+
+Run:
+
+```bash
+pytest tests/python/test_secrets.py tests/python/test_sidecar_manager.py -v
+```
+
+Expected: FAIL because lifecycle code is absent.
+
+- [ ] **Step 3: Implement generated-secret fallback**
+
+```python
+def ensure_secret(path: Path, *, nbytes: int = 32) -> str:
+    if path.exists():
+        return path.read_text(encoding="utf-8").strip()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    value = secrets.token_urlsafe(nbytes)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(value)
+    return value
+```
+
+The master-key file uses random bytes encoded safely for the Rust reader and is distinct from the API token.
+
+- [ ] **Step 4: Implement native artifact verification**
+
+`sidecar-release.json` maps platform/architecture to URL, SHA-256, and sidecar protocol version. Download to a temporary file, hash it, set executable permissions only after the hash matches, then atomically rename into `bin/`.
+
+- [ ] **Step 5: Implement native-first process management**
+
+Order:
+1. if `sidecar_mode=external`, health-check configured URL;
+2. if `sidecar_mode=docker`, health-check expected container endpoint and surface setup guidance if absent;
+3. default `native`: reuse healthy compatible sidecar or launch verified binary with secret/key/policy/state paths;
+4. poll `/healthz` until ready using a bounded startup timeout;
+5. reject protocol mismatch.
+
+Do not kill a healthy sidecar owned by another compatible profile process.
+
+- [ ] **Step 6: Implement REST and WebSocket client**
+
+Use Hermes' existing `websockets` dependency and a standard HTTP client already available in Hermes. `StreamClient.feed(kind, text) -> str` serialises sends under a lock and verifies returned sequence numbers.
+
+- [ ] **Step 7: Run tests**
+
+Run:
+
+```bash
+pytest tests/python/test_secrets.py tests/python/test_sidecar_manager.py tests/python/test_sidecar_client.py -v
+```
+
+Expected: PASS.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add gaze_privacy sidecar-release.json tests/python
+git commit -m "feat: manage native privacy sidecar"
+```
+
+---
+
+### Task 9: Provider request/response adapters and mandatory opaque-field blocking
+
+**Files:**
+- Create: `gaze_privacy/adapters/__init__.py`
+- Create: `gaze_privacy/adapters/common.py`
+- Create: `gaze_privacy/adapters/chat.py`
+- Create: `gaze_privacy/adapters/responses.py`
+- Create: `gaze_privacy/adapters/bedrock.py`
+- Create: `tests/python/test_request_adapters.py`
+- Create: `tests/python/test_response_adapters.py`
+
+**Interfaces:**
+- Consumes: Hermes `api_mode`, provider kwargs, completed provider response object.
+- Produces: `PreparedPayload(fields, apply)`; `extract_request_fields(api_mode, request)`; `extract_response_fields(api_mode, response)`; typed `UnsupportedCarrierError`.
+
+- [ ] **Step 1: Write request extraction tests for every supported wire shape**
+
+Protect text-bearing fields while preserving structural identifiers.
+
+Examples:
+- Chat/OpenAI-compatible: message text/content parts, system/developer content, tool results, tool descriptions, JSON-schema descriptions.
+- Anthropic Messages: system blocks, message text blocks, tool-result text, tool descriptions/input-schema descriptions.
+- Responses/Codex: `instructions`, `input` text blocks, tool descriptions/schema descriptions.
+- Bedrock Converse: system text, message text blocks, tool descriptions/schema descriptions.
+
+Assert model IDs, roles, content-part `type`, function/tool names, and schema property keys are not modified.
+
+- [ ] **Step 2: Add Review Focus test for opaque/multimodal content**
+
+```python
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}]},
+        {"input": [{"type": "input_audio", "audio": "opaque"}]},
+        {"messages": [{"role": "user", "content": [{"type": "unknown_blob", "payload": "opaque"}]}]},
+    ],
+)
+def test_mandatory_mode_rejects_uninspectable_carriers(payload):
+    with pytest.raises(UnsupportedCarrierError):
+        extract_request_fields("chat_completions", payload, mandatory=True)
+```
+
+Trusted-local bypass never calls these adapters, so local providers may still receive such payloads.
+
+- [ ] **Step 3: Run tests and verify failure**
+
+Run:
+
+```bash
+pytest tests/python/test_request_adapters.py tests/python/test_response_adapters.py -v
+```
+
+Expected: FAIL because adapters do not exist.
+
+- [ ] **Step 4: Implement path-addressed field extraction**
+
+Use JSON-pointer-like paths and copy-on-write application:
+
+```python
+@dataclass
+class PreparedPayload:
+    payload: Any
+    fields: list[TextField]
+
+    def apply(self, transformed: list[TextField]) -> Any:
+        if [f.path for f in transformed] != [f.path for f in self.fields]:
+            raise PrivacyProtocolError("sidecar returned mismatched field paths")
+        result = copy.deepcopy(self.payload)
+        for field in transformed:
+            set_path(result, field.path, field.text)
+        return result
+```
+
+Never recursively transform all strings blindly.
+
+- [ ] **Step 5: Implement completed-response extraction**
+
+For Chat/Anthropic/Bedrock-normalised responses restore:
+- `choices[].message.content`;
+- reasoning text when present;
+- refusal text;
+- `tool_calls[].function.arguments`.
+
+For Responses/Codex restore:
+- message output text/refusal text;
+- function-call `arguments`;
+- visible commentary text;
+- `output_text` if present.
+
+Encrypted signatures, IDs, model names, tool names, and structural metadata are never transformed.
+
+- [ ] **Step 6: Run tests**
+
+Run:
+
+```bash
+pytest tests/python/test_request_adapters.py tests/python/test_response_adapters.py -v
+```
+
+Expected: PASS.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add gaze_privacy/adapters tests/python/test_request_adapters.py tests/python/test_response_adapters.py
+git commit -m "feat: adapt Hermes provider payloads for privacy"
+```
+
+---
+
+### Task 10: Hermes middleware integration, streaming bridge, compatibility mode, and fallbacks
+
+**Files:**
+- Modify: `__init__.py`
+- Create: `gaze_privacy/middleware.py`
+- Create: `gaze_privacy/runtime.py`
+- Create: `gaze_privacy/events.py`
+- Create: `tests/python/test_middleware.py`
+- Create: `tests/python/test_stream_bridge.py`
+
+**Interfaces:**
+- Consumes: Tasks 1, 2, 8, and 9.
+- Produces: closed `llm_execution` middleware; closed `llm_stream_text` middleware; request-local stream context; sanitised `PrivacyEvent`.
+
+- [ ] **Step 1: Write protected-request lifecycle test**
+
+```python
+def test_external_provider_receives_only_cleaned_request(runtime):
+    seen = {}
+
+    def provider(request):
+        seen["request"] = request
+        return fake_chat_response("Hello <token>")
+
+    result = runtime.execute(
+        request={"messages": [{"role": "user", "content": "Email alice@example.invalid"}]},
+        next_call=provider,
+        provider="openrouter",
+        api_mode="chat_completions",
+        session_id="s1",
+        turn_id="t1",
+        api_request_id="t1:api:1",
+    )
+
+    assert "alice@example.invalid" not in repr(seen["request"])
+    assert result.choices[0].message.content == "Hello alice@example.invalid"
+```
+
+- [ ] **Step 2: Add fallback trust regression test**
+
+Simulate consecutive Hermes attempts:
+1. `local-vllm` explicitly trusted, no sidecar clean call;
+2. fallback `openrouter`, sidecar clean required;
+3. second external fallback `anthropic`, sidecar clean required again.
+
+Assert trust is evaluated from the provider argument on each middleware invocation.
+
+- [ ] **Step 3: Add mandatory compatibility tests**
+
+Feature detection checks both:
+- `register_middleware` accepts `failure_mode`;
+- Hermes exports/accepts `llm_stream_text`.
+
+Without both capabilities:
+- external provider + mandatory mode => `PrivacyBlockedError`;
+- trusted-local => bypass;
+- explicit compatibility mode => external call may proceed but event state is `protection_not_guaranteed`.
+
+- [ ] **Step 4: Run tests and verify failure**
+
+Run:
+
+```bash
+pytest tests/python/test_middleware.py tests/python/test_stream_bridge.py -v
+```
+
+Expected: FAIL because runtime middleware is absent.
+
+- [ ] **Step 5: Implement `llm_execution` middleware**
+
+Exact ordering:
+
+```python
+def llm_execution_middleware(*, request, next_call, provider, api_mode, **ctx):
+    if runtime.provider_policy.classify(provider) is ProtectionDecision.BYPASS:
+        runtime.events.record_bypass(provider=provider, **ctx)
+        return next_call(request)
+
+    runtime.require_fail_closed_capabilities()
+    runtime.sidecar.ensure_running()
+
+    prepared = extract_request_fields(api_mode, request, mandatory=runtime.config.mandatory_mode)
+    cleaned = runtime.sidecar.clean(namespace_from(ctx), prepared.fields)
+    protected_request = prepared.apply(cleaned.fields)
+
+    stream = runtime.sidecar.open_stream(namespace_from(ctx))
+    token = runtime.active_stream.set(stream)
+    try:
+        response = next_call(protected_request)
+        restored = restore_completed_response(runtime, api_mode, response, ctx)
+        stream.finish()
+        return restored
+    except Exception:
+        stream.abort()
+        raise
+    finally:
+        runtime.active_stream.reset(token)
+```
+
+If outbound cleaning fails, `next_call` is never invoked.
+
+- [ ] **Step 6: Implement synchronous live-stream transform**
+
+```python
+def llm_stream_text_middleware(*, text, kind, **_ctx):
+    stream = runtime.active_stream.get(None)
+    if stream is None:
+        raise PrivacyBlockedError("protected provider stream has no privacy context")
+    return {"text": stream.feed(kind=kind, text=text)}
+```
+
+Register both middleware callbacks with `failure_mode="closed"`.
+
+- [ ] **Step 7: Ensure final response restoration remains separate from live display restoration**
+
+Live stream restoration changes only what Hermes displays/TTS/interim-delivers. The completed response returned by `next_call` is independently restored through Task 9's response adapter before Hermes parses tool calls. This is what makes streamed `write_file` arguments contain real values at execution time without exposing tool JSON fragments to the UI.
+
+- [ ] **Step 8: Run tests**
+
+Run:
+
+```bash
+pytest tests/python/test_middleware.py tests/python/test_stream_bridge.py -v
+```
+
+Expected: PASS.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add __init__.py gaze_privacy/middleware.py gaze_privacy/runtime.py gaze_privacy/events.py tests/python/test_middleware.py tests/python/test_stream_bridge.py
+git commit -m "feat: enforce Gaze around Hermes LLM calls"
+```
+
+---
+
+### Task 11: Backend plugin API, sanitised event buffer, policy/session control, and sensitive reveal
+
+**Files:**
+- Create: `dashboard/manifest.json`
+- Create: `dashboard/plugin_api.py`
+- Create: `gaze_privacy/plugin_api_service.py`
+- Create: `gaze_privacy/reveal.py`
+- Create: `tests/python/test_plugin_api.py`
+- Create: `tests/python/test_reveal.py`
+
+**Interfaces:**
+- Consumes: runtime, policy store via sidecar, sanitised event buffer.
+- Produces: Desktop-safe REST namespace:
+  - `GET /status`
+  - `GET /events`
+  - `GET/PUT /policies/global`
+  - `GET/PUT /policies/profiles/{profile_id}`
+  - `POST /policies/validate`
+  - `POST /policies/test`
+  - `POST /policies/apply`
+  - `POST /policies/edit`
+  - `GET /providers`
+  - `PUT /providers/{provider_id}/trust`
+  - `GET /sessions`
+  - `POST /sessions/{profile_id}/{session_id}/recover`
+  - `DELETE /sessions/{profile_id}/{session_id}`
+  - `POST /events/{event_id}/reveal`.
+
+- [ ] **Step 1: Write API tests**
+
+Use FastAPI `TestClient`. Assert status returns capability state and sidecar mode without secrets. Assert policy writes validate before atomic activation.
+
+- [ ] **Step 2: Add Review Focus tests for reveal behaviour**
+
+Backend reveal tokens are single-event, short-lived capabilities:
+
+```python
+def test_reveal_token_expires_and_never_enters_event_log(service, clock):
+    event_id = service.events.add_sanitised(sample_event())
+    grant = service.reveal.issue(event_id, ttl_seconds=60)
+    assert service.reveal.read(grant.token)["original"] == "synthetic@example.invalid"
+
+    clock.advance(61)
+    with pytest.raises(RevealExpired):
+        service.reveal.read(grant.token)
+
+    assert "synthetic@example.invalid" not in service.events.serialized_log()
+```
+
+Also test profile mismatch and reuse after successful read if grants are single-use.
+
+- [ ] **Step 3: Run tests and verify failure**
+
+Run:
+
+```bash
+pytest tests/python/test_plugin_api.py tests/python/test_reveal.py -v
+```
+
+Expected: FAIL because the API service does not exist.
+
+- [ ] **Step 4: Implement narrow Desktop-facing service**
+
+`dashboard/plugin_api.py` should be a thin `APIRouter` wrapper. Keep sidecar credentials inside `gaze_privacy/plugin_api_service.py`; never return them.
+
+- [ ] **Step 5: Implement bounded sanitised event storage**
+
+Use a fixed-size deque. Persist only metadata permitted by the spec. Sensitive original/protected/restored payloads, when debug capture is enabled, stay in an in-memory ephemeral store keyed by event ID and are cleared on session end/restart.
+
+- [ ] **Step 6: Implement temporary reveal grants**
+
+Generate random opaque grants, bind them to event/profile, expire after 60 seconds, and never persist grants or returned data. A plugin setting may shorten the timeout but not disable expiration.
+
+- [ ] **Step 7: Run tests**
+
+Run:
+
+```bash
+pytest tests/python/test_plugin_api.py tests/python/test_reveal.py -v
+```
+
+Expected: PASS.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add dashboard gaze_privacy/plugin_api_service.py gaze_privacy/reveal.py tests/python/test_plugin_api.py tests/python/test_reveal.py
+git commit -m "feat: expose safe Hermes Desktop privacy API"
+```
+
+---
+
+### Task 12: Hermes Desktop workspace shell, overview, live debug, and status indicator
+
+**Files:**
+- Create: `desktop/plugin.js`
+- Create: `tests/desktop/plugin.test.mjs`
+- Modify: `pyproject.toml` or root test scripts only if needed to invoke the Desktop test harness
+
+**Interfaces:**
+- Consumes: `ctx.rest`, `ctx.socket`, `host.state.focusedSessionProfile`, backend API from Task 11.
+- Produces: `/gaze-privacy` workspace route, sidebar item, status-bar item, Overview and Live Debug tabs.
+
+- [ ] **Step 1: Write static/runtime contract tests**
+
+The Desktop plugin is uncompiled ESM. Tests should assert:
+- no JSX syntax;
+- imports only from `@hermes/plugin-sdk`, `react`, `react/jsx-runtime`;
+- route and sidebar contributions use the same path;
+- no direct `65113` URL or bearer secret reference exists.
+
+- [ ] **Step 2: Implement plugin registration**
+
+Use a single `desktop/plugin.js`:
+
+```javascript
+import {
+  ROUTES_AREA,
+  SIDEBAR_NAV_AREA,
+  Button,
+  Codicon,
+  StatusDot,
+  Tabs,
+  useQuery,
+  useValue,
+  host
+} from '@hermes/plugin-sdk'
+import { useEffect, useState } from 'react'
+import { jsx, jsxs } from 'react/jsx-runtime'
+
+const ID = 'gaze-hermes-privacy'
+const PATH = '/gaze-privacy'
+
+export default {
+  id: ID,
+  name: 'Gaze Privacy',
+  register(ctx) {
+    ctx.registerMany([
+      {
+        id: 'workspace',
+        area: ROUTES_AREA,
+        data: { path: PATH },
+        render: () => jsx(PrivacyWorkspace, { ctx })
+      },
+      {
+        id: 'nav',
+        area: SIDEBAR_NAV_AREA,
+        data: { path: PATH, label: 'Gaze Privacy', codicon: 'shield' }
+      },
+      {
+        id: 'status',
+        area: 'statusBar.right',
+        render: () => jsx(PrivacyStatus, { ctx })
+      }
+    ])
+  }
+}
+```
+
+Use actual SDK component names verified against the current Desktop SDK when implementing; if `Tabs` is exposed as `TabsRoot/TabsList/TabsTrigger/TabsContent`, import those exact exports rather than inventing an alias.
+
+- [ ] **Step 3: Implement Overview**
+
+Fetch `/status` with React Query and show:
+- protection state;
+- sidecar health/mode/version;
+- NER status/version;
+- effective policy hash;
+- protected/bypassed/blocked counters;
+- Hermes fail-closed and stream-transform capability state.
+
+No hard-coded colours; use SDK components and theme variables.
+
+- [ ] **Step 4: Implement Live Debug**
+
+Use `ctx.socket('/events', ...)` when available and React Query polling fallback because Desktop sockets are no-op on OAuth remotes. Render request timeline metadata only.
+
+- [ ] **Step 5: Implement status-bar state**
+
+Map current status to:
+- Protected;
+- Local bypass;
+- Blocked;
+- Error.
+
+Clicking the status item navigates to `/gaze-privacy`.
+
+- [ ] **Step 6: Run Desktop tests**
+
+Run the repo's chosen Node test command plus Hermes Desktop plugin load check against the current SDK.
+
+Expected: plugin parses as ESM, registers contributions, and never references the sidecar directly.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add desktop tests/desktop
+git commit -m "feat: add Hermes Desktop privacy workspace"
+```
+
+---
+
+### Task 13: Desktop Rules, Test Lab, Providers, Sessions, and temporary sensitive reveal UI
+
+**Files:**
+- Modify: `desktop/plugin.js`
+- Modify: `tests/desktop/plugin.test.mjs`
+- Create: `tests/desktop/reveal.test.mjs`
+- Create: `tests/desktop/policy-editor.test.mjs`
+
+**Interfaces:**
+- Consumes: Task 11 policy/provider/session/reveal endpoints.
+- Produces: visual + raw TOML editor, semantic diff/apply flow, local Test Lab, provider trust editor, session management, ephemeral reveal state.
+
+- [ ] **Step 1: Write policy-editor tests**
+
+Assert:
+- raw TOML edits validate before Apply enables;
+- visual edits call `/policies/edit` and receive updated TOML;
+- advanced-only nodes are displayed but not deleted;
+- switching profile loads inherited base plus overlay separately.
+
+- [ ] **Step 2: Implement Rules tab**
+
+Two modes:
+- Visual;
+- Advanced TOML.
+
+Visual editor fields:
+- name;
+- enabled;
+- detector kind;
+- pattern/dictionary;
+- class;
+- action;
+- priority/scope where supported.
+
+Apply flow is `edit -> validate -> semantic diff -> apply`. Never save invalid policy over the active version.
+
+- [ ] **Step 3: Implement Test Lab**
+
+POST unsaved draft + sample text to `/policies/test`. Display original sample, detections, protected text, restored text, round-trip status, and responsible rule. The endpoint must never call an LLM provider.
+
+- [ ] **Step 4: Implement Providers and Sessions tabs**
+
+Providers display `PROTECTED`, `TRUSTED LOCAL`, or `BLOCKED / UNSUPPORTED`. Trust changes require explicit confirmation.
+
+Sessions display profile/session ID, timestamps, snapshot state, mapping count, policy version, and recover/reset/delete actions. Reset/delete requires confirmation that previous mappings will be abandoned.
+
+- [ ] **Step 5: Add Review Focus reveal lifecycle tests**
+
+Test UI state clears when:
+- 60-second expiry fires;
+- focused profile changes;
+- workspace component unmounts;
+- backend/gateway disconnects.
+
+The reveal body must not be copied into `ctx.storage`, React Query persistent cache, URL state, or logs.
+
+- [ ] **Step 6: Implement reveal control**
+
+The button requests `POST /events/{id}/reveal`, keeps returned sensitive data in component-local `useState`, schedules clearing, and clears in `useEffect` cleanup/profile/disconnect handlers.
+
+- [ ] **Step 7: Run Desktop tests**
+
+Expected: all editor, provider, session, and reveal lifecycle tests pass.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add desktop/plugin.js tests/desktop
+git commit -m "feat: add privacy policy and session controls"
+```
+
+---
+
+### Task 14: Docker packaging, release artifacts, CI, and supply-chain verification
+
+**Files:**
+- Create: `docker/Dockerfile`
+- Create: `docker-compose.yml`
+- Create: `.github/workflows/test.yml`
+- Create: `.github/workflows/release.yml`
+- Create: `scripts/update-sidecar-manifest.py`
+- Modify: `sidecar-release.json`
+- Create: `tests/python/test_release_manifest.py`
+
+**Interfaces:**
+- Consumes: sidecar binary and Python plugin.
+- Produces: native binaries, Docker image, checksums, release manifest, CI gates.
+
+- [ ] **Step 1: Write release-manifest tests**
+
+Reject:
+- unsupported platform tuple;
+- duplicate artifact tuple;
+- malformed SHA-256;
+- protocol mismatch;
+- non-HTTPS release URL outside explicitly allowed local test fixtures.
+
+- [ ] **Step 2: Implement Docker image**
+
+Build the same Rust sidecar binary used by native installs. Runtime image runs as non-root, exposes 65113, reads secret/key files from mounted paths, and stores encrypted state on a volume. Compose publishes only `127.0.0.1:65113:65113`.
+
+- [ ] **Step 3: Implement CI test matrix**
+
+At minimum:
+- Python tests on Linux, macOS, Windows;
+- Rust format/clippy/tests on Linux plus compile/test coverage on supported release targets;
+- Desktop ESM tests;
+- synthetic privacy regression tests;
+- no-secret/log scans.
+
+- [ ] **Step 4: Implement release workflow**
+
+Build supported native targets, produce SHA-256 values, attach binaries, publish Docker image, and generate/update `sidecar-release.json`. Never publish a manifest entry for a binary that did not build and test.
+
+- [ ] **Step 5: Run manifest and local build tests**
+
+```bash
+pytest tests/python/test_release_manifest.py -v
+cargo test --manifest-path sidecar/Cargo.toml
+docker compose config
+```
+
+Expected: PASS.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add docker docker-compose.yml .github scripts sidecar-release.json tests/python/test_release_manifest.py
+git commit -m "build: add verified sidecar release pipeline"
+```
+
+---
+
+### Task 15: End-to-end privacy regression suite, documentation, and release gate
+
+**Files:**
+- Create: `tests/fixtures/pii-regression.json`
+- Create: `tests/e2e/test_privacy_boundary.py`
+- Create: `tests/e2e/test_tool_restore.py`
+- Create: `tests/e2e/test_remote_profile_isolation.py`
+- Create: `tests/e2e/test_logging.py`
+- Create: `README.md`
+- Create: `SECURITY.md`
+- Create: `docs/architecture.md`
+- Create: `docs/install.md`
+- Create: `docs/debugging.md`
+- Create: `docs/threat-model.md`
+
+**Interfaces:**
+- Consumes: complete plugin, patched/supported Hermes, sidecar, Desktop/API contracts.
+- Produces: release-grade evidence that the trust boundary works end to end.
+
+- [ ] **Step 1: Build a synthetic-only regression corpus**
+
+Include:
+- names;
+- emails;
+- phone numbers;
+- postal/location data;
+- organisations;
+- custom identifiers;
+- multilingual examples supported by configured NER/rulepacks;
+- Markdown;
+- JSON;
+- XML;
+- LaTeX;
+- source code;
+- tool calls;
+- nested structured payloads;
+- deliberately awkward stream split points.
+
+No real personal data.
+
+- [ ] **Step 2: Write an external-provider capture test**
+
+Run Hermes against a local fake external provider endpoint that records received request bytes. Assert:
+- fixture PII is absent from captured request;
+- Gaze tokens are present where expected;
+- Hermes-visible final response contains restored synthetic values;
+- event logs contain only classes/counts/metadata.
+
+- [ ] **Step 3: Write the LaTeX/tool-call acceptance test**
+
+Fake provider returns a streamed `write_file` call whose arguments contain Gaze tokens split across provider chunks. Assert the completed tool call handed to Hermes contains the original synthetic name/email and valid JSON, and the resulting LaTeX source contains original values.
+
+- [ ] **Step 4: Write crash/recovery acceptance test**
+
+1. clean a request and persist session;
+2. terminate sidecar;
+3. restart it with the same key;
+4. restore a response containing previous tokens;
+5. verify byte-exact recovery;
+6. restart with a wrong key and assert external calls for that session block.
+
+- [ ] **Step 5: Write multi-profile isolation acceptance test**
+
+Profile A's token must not restore under Profile B. In dedicated-sidecar mode, assert each profile gets its configured process/endpoint and cannot access the other's snapshot directory.
+
+- [ ] **Step 6: Write mandatory compatibility acceptance test**
+
+Against an unpatched Hermes fixture, external calls must stop before provider invocation. Against a patched Hermes fixture, both fail-closed execution and live stream transform capability probes pass.
+
+- [ ] **Step 7: Write logging leak test**
+
+Capture Python and Rust logs while running the corpus. Assert none of the raw synthetic PII strings, API token, or encryption key appear.
+
+- [ ] **Step 8: Write operator documentation**
+
+README/install docs must cover:
+- one-click/hybrid Hermes installation;
+- native-first sidecar;
+- optional Docker/external sidecar modes;
+- trusted-local semantics;
+- fail-closed Hermes requirement;
+- NER first-run download and offline provisioning;
+- policy layering;
+- Desktop controls;
+- compatibility mode warning;
+- data-at-rest layout;
+- security reporting.
+
+Threat model must explicitly state that Hermes/local host are trusted and external model providers are outside the privacy boundary.
+
+- [ ] **Step 9: Run the full release gate**
+
+```bash
+pytest tests/python tests/e2e -v
+cargo fmt --manifest-path sidecar/Cargo.toml -- --check
+cargo clippy --manifest-path sidecar/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path sidecar/Cargo.toml
+```
+
+Run Desktop tests and the Docker health/auth smoke test as defined by Task 14.
+
+Expected: every suite passes, no PII/log leak assertion fires, and the fake external provider never receives original protected values.
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add tests README.md SECURITY.md docs
+git commit -m "test: certify end-to-end privacy boundary"
+```
+
+---
+
+## Final integration sequence
+
+After all task commits:
+
+1. Rebase the plugin worktree on the latest `gaze-hermes-privacy` main branch.
+2. Rebase the Hermes upstream branch on the current `NousResearch/hermes-agent` main branch and rerun Task 1's focused suites.
+3. Run the plugin full release gate against that exact Hermes revision.
+4. Record the tested Hermes commit and upstream PR URL in `docs/upstream-hermes.md`.
+5. Open/update the upstream Hermes PR.
+6. Open a `gaze-hermes-privacy` release PR containing only reviewed task commits.
+7. Run CI from a clean checkout before merge.
+8. Merge only when both the privacy boundary suite and ordinary Hermes middleware/stream regressions are green.
+
+## Definition of Done
+
+The implementation is complete only when all of the following are demonstrated in automated tests:
+
+- external providers never receive original synthetic PII for supported payloads;
+- unsupported/uninspectable external payloads block in mandatory mode;
+- trusted-local bypass is explicit and exact-match only;
+- provider fallback reevaluates trust;
+- live text/reasoning/commentary is restored before Desktop/TTS delivery;
+- completed responses are restored before Hermes tool parsing;
+- streamed tool arguments produce valid restored tool calls;
+- sidecar failure cannot trigger fail-open provider execution on supported Hermes;
+- restart recovery uses encrypted snapshots and rejects wrong keys/tampering;
+- policy edits cannot replace a working policy until validation succeeds;
+- Desktop sensitive reveal is ephemeral and non-persistent;
+- default install works without Docker, Rust, or a separate Gaze installation;
+- Docker remains a supported optional deployment;
+- ordinary logs contain no raw sensitive values or secrets.
