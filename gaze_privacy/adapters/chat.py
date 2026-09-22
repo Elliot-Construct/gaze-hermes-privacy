@@ -123,10 +123,10 @@ def _extract_anthropic_messages_response(response: dict) -> PreparedPayload:
     return PreparedPayload(payload=response, fields=fields)
 
 
-def restore_completed_response(client, namespace, api_mode: str, response: dict) -> dict:
+async def restore_completed_response(client, namespace, api_mode: str, response: dict) -> dict:
     """Restore a completed provider response using the sidecar client."""
     prepared = extract_response_fields(api_mode, response)
     if not prepared.fields:
         return response
-    restored = client.restore(namespace, prepared.fields)
+    restored = await client.restore(namespace, prepared.fields)
     return prepared.apply(restored["fields"])

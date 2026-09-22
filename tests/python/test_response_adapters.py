@@ -15,7 +15,7 @@ class FakeClient:
     def __init__(self, mapping: dict[str, str]):
         self.mapping = mapping
 
-    def restore(self, namespace, fields):
+    async def restore(self, namespace, fields):
         result = {"fields": []}
         for f in fields:
             restored_text = f.text
@@ -25,7 +25,8 @@ class FakeClient:
         return result
 
 
-def test_chat_completions_response_extracts_content():
+@pytest.mark.asyncio
+async def test_chat_completions_response_extracts_content():
     response = {
         "id": "chatcmpl-123",
         "object": "chat.completion",
@@ -46,12 +47,12 @@ def test_chat_completions_response_extracts_content():
     assert "/choices/0/message/content" in paths
     assert prepared.payload["id"] == "chatcmpl-123"
     assert prepared.payload["model"] == "gpt-4"
-    # Structural fields preserved
     assert prepared.payload["choices"][0]["message"]["role"] == "assistant"
     assert prepared.payload["choices"][0]["finish_reason"] == "stop"
 
 
-def test_chat_completions_response_with_tool_calls():
+@pytest.mark.asyncio
+async def test_chat_completions_response_with_tool_calls():
     response = {
         "id": "chatcmpl-123",
         "object": "chat.completion",
@@ -80,12 +81,12 @@ def test_chat_completions_response_with_tool_calls():
     prepared = extract_response_fields("chat_completions", response)
     paths = [f.path for f in prepared.fields]
     assert "/choices/0/message/tool_calls/0/function/arguments" in paths
-    # Other fields preserved
     assert prepared.payload["choices"][0]["message"]["role"] == "assistant"
     assert prepared.payload["choices"][0]["finish_reason"] == "tool_calls"
 
 
-def test_anthropic_messages_response_extracts_content():
+@pytest.mark.asyncio
+async def test_anthropic_messages_response_extracts_content():
     response = {
         "id": "msg_123",
         "type": "message",
@@ -101,13 +102,13 @@ def test_anthropic_messages_response_extracts_content():
     paths = [f.path for f in prepared.fields]
     assert "/content/0/text" in paths
     assert "/content/1/text" in paths
-    # Structural preserved
     assert prepared.payload["id"] == "msg_123"
     assert prepared.payload["role"] == "assistant"
     assert prepared.payload["stop_reason"] == "end_turn"
 
 
-def test_bedrock_converse_response_extracts_content():
+@pytest.mark.asyncio
+async def test_bedrock_converse_response_extracts_content():
     response = {
         "output": {
             "message": {
@@ -120,12 +121,12 @@ def test_bedrock_converse_response_extracts_content():
     prepared = extract_response_fields("bedrock_converse", response)
     paths = [f.path for f in prepared.fields]
     assert "/output/message/content/0/text" in paths
-    # Structural preserved
     assert prepared.payload["output"]["message"]["role"] == "assistant"
     assert prepared.payload["stopReason"] == "end_turn"
 
 
-def test_codex_responses_response_extracts_output_text():
+@pytest.mark.asyncio
+async def test_codex_responses_response_extracts_output_text():
     response = {
         "id": "resp_123",
         "model": "gpt-4",
@@ -138,7 +139,6 @@ def test_codex_responses_response_extracts_output_text():
     paths = [f.path for f in prepared.fields]
     assert "/output/0/content/0/text" in paths
     assert "/output/1/arguments" in paths
-    # Structural preserved
     assert prepared.payload["id"] == "resp_123"
     assert prepared.payload["output"][0]["role"] == "assistant"
     assert prepared.payload["output"][0]["type"] == "message"
@@ -146,17 +146,19 @@ def test_codex_responses_response_extracts_output_text():
     assert prepared.payload["output"][1]["call_id"] == "call_123"
 
 
-def test_restore_completed_response_chat_completions():
+@pytest.mark.asyncio
+async def test_restore_completed_response_chat_completions():
     client = FakeClient({"Hello <token> there": "Hello alice@example.invalid there"})
     namespace = {"profile_id": "default", "session_id": "s1", "request_id": "r1"}
     response = {
         "choices": [{"message": {"content": "Hello <token> there"}}],
     }
-    result = restore_completed_response(client, namespace, "chat_completions", response)
+    result = await restore_completed_response(client, namespace, "chat_completions", response)
     assert result["choices"][0]["message"]["content"] == "Hello alice@example.invalid there"
 
 
-def test_restore_completed_response_preserves_structure():
+@pytest.mark.asyncio
+async def test_restore_completed_response_preserves_structure():
     client = FakeClient({"<token>": "alice@example.invalid"})
     namespace = {"profile_id": "default", "session_id": "s1", "request_id": "r1"}
     response = {
@@ -166,14 +168,15 @@ def test_restore_completed_response_preserves_structure():
             {"message": {"role": "assistant", "content": "Contact <token>"}}
         ],
     }
-    result = restore_completed_response(client, namespace, "chat_completions", response)
+    result = await restore_completed_response(client, namespace, "chat_completions", response)
     assert result["id"] == "chatcmpl-123"
     assert result["model"] == "gpt-4"
     assert result["choices"][0]["message"]["role"] == "assistant"
     assert result["choices"][0]["message"]["content"] == "Contact alice@example.invalid"
 
 
-def test_restore_completed_response_tool_call_arguments():
+@pytest.mark.asyncio
+async def test_restore_completed_response_tool_call_arguments():
     client = FakeClient({'{"content": "Dear <token>"}': '{"content": "Dear alice@example.invalid"}'})
     namespace = {"profile_id": "default", "session_id": "s1", "request_id": "r1"}
     response = {
@@ -191,11 +194,12 @@ def test_restore_completed_response_tool_call_arguments():
             }
         ],
     }
-    result = restore_completed_response(client, namespace, "chat_completions", response)
+    result = await restore_completed_response(client, namespace, "chat_completions", response)
     assert result["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] == '{"content": "Dear alice@example.invalid"}'
 
 
-def test_restore_no_fields_returns_original():
+@pytest.mark.asyncio
+async def test_restore_no_fields_returns_original():
     client = FakeClient({})
     namespace = {"profile_id": "default", "session_id": "s1", "request_id": "r1"}
     response = {"id": "chatcmpl-123", "choices": [{"message": {"content": "No tokens here"}}]}
@@ -204,7 +208,7 @@ def test_restore_no_fields_returns_original():
     original = chat_module.extract_response_fields
     chat_module.extract_response_fields = lambda *args, **kwargs: type("Prepared", (), {"fields": [], "payload": response})()
     try:
-        result = restore_completed_response(client, namespace, "chat_completions", response)
+        result = await restore_completed_response(client, namespace, "chat_completions", response)
         assert result is response
     finally:
         chat_module.extract_response_fields = original
