@@ -1221,6 +1221,27 @@ Tests must prove:
 - host scope reuses one compatible endpoint across profiles;
 - profile scope launches separate endpoints and state directories and consumes the sidecar `--ready-file` result rather than guessing a port.
 
+```python
+def test_generated_secret_is_persistent_and_private(tmp_path):
+    path = tmp_path / "api-token"
+    first = ensure_secret(path)
+    second = ensure_secret(path)
+    assert first == second
+    assert first
+    if os.name != "nt":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_profile_scope_uses_ready_file_endpoint(manager, fake_launcher):
+    manager.config = replace(manager.config, sidecar_scope="profile")
+    fake_launcher.ready_address = "127.0.0.1:43127"
+    managed = manager.ensure_running("writer")
+    assert managed.client.base_url == "http://127.0.0.1:43127"
+    assert fake_launcher.argv_contains("--bind", "127.0.0.1:0")
+```
+
+Add adjacent tests for operator-supplied secrets, bad binary hashes, Docker/external no-download behavior, and host-scope endpoint reuse.
+
 - [ ] **Step 2: Run tests and verify failure**
 
 Run:
@@ -1715,7 +1736,25 @@ git commit -m "feat: enforce Gaze around Hermes LLM calls"
 
 - [ ] **Step 1: Write API tests**
 
-Use FastAPI `TestClient`. Assert status returns capability state and sidecar mode without secrets. Assert policy writes validate before atomic activation.
+Use FastAPI `TestClient`. Assert status returns capability state and sidecar mode without secrets, and policy writes validate before atomic activation.
+
+```python
+def test_status_is_desktop_safe(client):
+    response = client.get("/status")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["sidecar"]["mode"] in {"native", "docker", "external"}
+    serialized = json.dumps(body)
+    assert "api_token" not in serialized
+    assert "master_key" not in serialized
+    assert "Authorization" not in serialized
+
+
+def test_invalid_policy_never_replaces_active_policy(client, active_policy_text):
+    response = client.post("/policies/apply", json={"scope": "global", "toml": "not = [valid"})
+    assert response.status_code == 422
+    assert client.get("/policies/global").json()["toml"] == active_policy_text
+```
 
 - [ ] **Step 2: Add Review Focus tests for reveal behaviour**
 
@@ -1748,15 +1787,74 @@ Expected: FAIL because the API service does not exist.
 
 - [ ] **Step 4: Implement narrow Desktop-facing service**
 
-`dashboard/plugin_api.py` should be a thin `APIRouter` wrapper. Keep sidecar credentials inside `gaze_privacy/plugin_api_service.py`; never return them.
+`dashboard/plugin_api.py` is a thin `APIRouter` wrapper. Keep sidecar credentials inside `gaze_privacy/plugin_api_service.py`; never return them.
+
+```python
+router = APIRouter()
+service = PluginApiService.from_runtime()
+
+@router.get("/status")
+def status():
+    return service.status()
+
+@router.get("/events")
+def events(limit: int = 100):
+    return {"events": service.events.list(limit=min(max(limit, 1), 500))}
+
+@router.post("/policies/validate")
+def validate_policy(request: PolicyTextRequest):
+    return service.validate_policy(request)
+```
+
+Every route delegates to typed service methods. Router exceptions are converted to sanitised HTTP errors that contain codes/metadata only, never sensitive request bodies.
 
 - [ ] **Step 5: Implement bounded sanitised event storage**
 
 Use a fixed-size deque. Persist only metadata permitted by the spec. Sensitive original/protected/restored payloads, when debug capture is enabled, stay in an in-memory ephemeral store keyed by event ID and are cleared on session end/restart.
 
+```python
+class EventBuffer:
+    def __init__(self, max_events: int = 500):
+        self._events = deque(maxlen=max_events)
+        self._sensitive: dict[str, dict[str, str]] = {}
+
+    def add(self, event: PrivacyEvent, sensitive: dict[str, str] | None = None) -> None:
+        self._events.append(event.sanitised_dict())
+        if sensitive is not None:
+            self._sensitive[event.id] = dict(sensitive)
+
+    def clear_session(self, profile_id: str, session_id: str) -> None:
+        self._sensitive = {
+            event_id: value
+            for event_id, value in self._sensitive.items()
+            if not value_matches_session(value, profile_id, session_id)
+        }
+```
+
 - [ ] **Step 6: Implement temporary reveal grants**
 
 Generate random opaque grants, bind them to event/profile, expire after 60 seconds, and never persist grants or returned data. A plugin setting may shorten the timeout but not disable expiration.
+
+```python
+@dataclass
+class RevealGrant:
+    event_id: str
+    profile_id: str
+    expires_at: float
+    consumed: bool = False
+
+def issue_reveal(self, event_id: str, profile_id: str, ttl_seconds: int = 60) -> str:
+    ttl = min(max(int(ttl_seconds), 1), 60)
+    token = secrets.token_urlsafe(32)
+    self._grants[token] = RevealGrant(
+        event_id=event_id,
+        profile_id=profile_id,
+        expires_at=self._clock() + ttl,
+    )
+    return token
+```
+
+`read_reveal(token, profile_id)` rejects missing, expired, profile-mismatched, or consumed grants; successful reads mark the grant consumed before returning the in-memory payload.
 
 - [ ] **Step 7: Run tests**
 
