@@ -4,7 +4,7 @@
 
 **Goal:** Build a standalone open-source Hermes plugin that reversibly pseudonymises PII before external LLM calls, restores responses locally before Hermes parses them, preserves live streaming, and exposes a native Hermes Desktop privacy console.
 
-**Architecture:** A root-level Hermes Python plugin owns provider trust, request/response adaptation, fail-closed middleware integration, and lifecycle management for a native Rust sidecar. The sidecar embeds Gaze 0.14.x crates, owns reversible mappings and encrypted snapshots, exposes authenticated loopback REST/WebSocket APIs, and never routes LLM traffic itself. A single uncompiled Hermes Desktop `desktop/plugin.js` talks only to the Python plugin's `/api/plugins/gaze-hermes-privacy` namespace.
+**Architecture:** A root-level Hermes Python plugin owns provider trust, request/response adaptation, fail-closed middleware integration, and lifecycle management for a native Rust sidecar. The sidecar embeds Gaze 0.14.0 crates, owns reversible mappings and encrypted snapshots, exposes authenticated loopback REST/WebSocket APIs, and never routes LLM traffic itself. A single uncompiled Hermes Desktop `desktop/plugin.js` talks only to the Python plugin's `/api/plugins/gaze-hermes-privacy` namespace.
 
 **Tech Stack:** Python 3.11+, Hermes Agent plugin/middleware APIs, Rust 1.89+, Gaze 0.14.0 crates, Axum/Tokio WebSockets, ChaCha20-Poly1305, TOML/toml_edit, pytest, cargo test, Hermes Desktop plugin SDK, GitHub Actions, Docker.
 
@@ -894,8 +894,10 @@ Expected: FAIL because the routes are absent.
 - [ ] **Step 3: Implement one Gaze transaction across all outbound fields**
 
 ```rust
-let handle = registry.get_or_restore(&request.namespace).await?;
-let mut tx = handle.session.begin_transaction();
+let session_key = request.namespace.session_key();
+let handle = registry.get_or_restore(&session_key).await?;
+let mut session = handle.session.lock().await;
+let mut tx = session.begin_transaction();
 let mut cleaned = Vec::with_capacity(request.fields.len());
 
 for field in &request.fields {
@@ -908,7 +910,8 @@ for field in &request.fields {
 }
 
 tx.commit()?;
-registry.persist(&request.namespace).await?;
+drop(session);
+registry.persist(&session_key).await?;
 ```
 
 Only commit after all fields succeed.
@@ -1388,7 +1391,7 @@ def llm_stream_text_middleware(
     return {"text": stream.feed(kind=kind, text=text)}
 ```
 
-`StreamRegistry.reserve(namespace, client=...)` runs before `next_call` and stores the exact profile-aware client selected by `SidecarManager`. `get_or_open()` lazily opens that client's authenticated sidecar WebSocket on the first live delta and rejects an unknown external request key. The reservation key remains `(session_id, api_request_id)` because Hermes session IDs are already runtime-unique; the stored reservation carries `profile_id` and must verify it on access. This avoids relying on a `ContextVar` crossing Hermes' streaming worker threads and avoids opening a WebSocket for non-streaming calls. Trusted-local streams pass through unchanged.
+`StreamRegistry.reserve(namespace, client=managed.client)` runs before `next_call` and stores the exact profile-aware client selected by `SidecarManager`. `get_or_open()` lazily opens that client's authenticated sidecar WebSocket on the first live delta and rejects an unknown external request key. The reservation key remains `(session_id, api_request_id)` because Hermes session IDs are already runtime-unique; the stored reservation carries `profile_id` and must verify it on access. This avoids relying on a `ContextVar` crossing Hermes' streaming worker threads and avoids opening a WebSocket for non-streaming calls. Trusted-local streams pass through unchanged.
 
 Register both middleware callbacks with `failure_mode="closed"`.
 
