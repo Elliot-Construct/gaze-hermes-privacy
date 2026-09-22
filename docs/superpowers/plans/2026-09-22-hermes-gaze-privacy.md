@@ -2071,38 +2071,81 @@ git commit -m "feat: add Hermes Desktop privacy workspace"
 
 - [ ] **Step 1: Write policy-editor tests**
 
-Assert:
-- raw TOML edits validate before Apply enables;
-- visual edits call `/policies/edit` and receive updated TOML;
-- advanced-only nodes are displayed but not deleted;
-- switching profile loads inherited base plus overlay separately.
+The Node tests remain dependency-free source-contract tests. Add:
+
+```javascript
+test('policy editor uses edit validate apply flow', async () => {
+  const source = await readFile(new URL('../../desktop/plugin.js', import.meta.url), 'utf8')
+  assert.match(source, /\/policies\/validate/)
+  assert.match(source, /\/policies\/edit/)
+  assert.match(source, /\/policies\/apply/)
+  assert.match(source, /Advanced TOML/)
+  assert.match(source, /focusedSessionProfile/)
+})
+```
+
+Backend Task 11 tests verify semantic policy preservation; the Desktop test pins that the UI uses the safe edit/validate/apply path rather than writing files directly.
 
 - [ ] **Step 2: Implement Rules tab**
 
-Two modes:
-- Visual;
-- Advanced TOML.
+Use two modes, `Visual` and `Advanced TOML`. The visual editor exposes only fields that map losslessly to Gaze 0.14 policy TOML: recogniser name/kind/pattern/class, dictionary source, case sensitivity/token family, rule identity/action, locales, and NER settings. Do not invent recogniser `enabled`, `priority`, `scope`, or `description` keys.
 
-The visual editor exposes only fields that map losslessly to Gaze 0.14 policy TOML:
-- custom recogniser `name`, `kind`, `pattern`, `class`;
-- dictionary source: inline `terms`, `terms_file`, or `terms_from_context`;
-- `case_sensitive` and `token_family`;
-- class/column rule identity plus `action`;
-- active locales and NER threshold/model path.
+```javascript
+async function applyVisualEdit(ctx, scope, edit) {
+  const edited = await ctx.rest('/policies/edit', {
+    method: 'POST',
+    body: { scope, edit }
+  })
+  const validated = await ctx.rest('/policies/validate', {
+    method: 'POST',
+    body: { scope, toml: edited.toml }
+  })
+  if (!validated.valid) throw new Error('Policy validation failed')
+  return ctx.rest('/policies/apply', {
+    method: 'POST',
+    body: { scope, toml: edited.toml, expected_hash: edited.base_hash }
+  })
+}
+```
 
-Do not invent Gaze policy keys such as recogniser `enabled`, `priority`, `scope`, or `description`. Profile inheritance/removal is represented by the plugin's overlay schema from Task 4, and any valid construct not represented by the visual editor remains Advanced-only and byte-preserved.
-
-Apply flow is `edit -> validate -> semantic diff -> apply`. Never save invalid policy over the active version.
+Profile inheritance/removal is represented by the plugin overlay schema from Task 4. Any valid construct not represented by the visual editor remains Advanced-only and byte-preserved. Both modes show the semantic diff before the final Apply action.
 
 - [ ] **Step 3: Implement Test Lab**
 
-POST unsaved draft + sample text to `/policies/test`. Display original sample, detections, protected text, restored text, round-trip status, and responsible rule. The endpoint must never call an LLM provider.
+POST the unsaved draft plus sample text to `/policies/test` and render the local round trip:
+
+```javascript
+async function runPolicyTest(ctx, scope, toml, sample) {
+  return ctx.rest('/policies/test', {
+    method: 'POST',
+    body: { scope, toml, sample }
+  })
+}
+```
+
+Display original sample, detections, protected text, restored text, round-trip status, and responsible rule. The backend endpoint is sidecar-local and never calls an LLM provider.
 
 - [ ] **Step 4: Implement Providers and Sessions tabs**
 
-Providers display `PROTECTED`, `TRUSTED LOCAL`, or `BLOCKED / UNSUPPORTED`. Trust changes require explicit confirmation.
+Providers display `PROTECTED`, `TRUSTED LOCAL`, or `BLOCKED / UNSUPPORTED`. After explicit confirmation, update trust with:
 
-Sessions display profile/session ID, timestamps, snapshot state, mapping count, policy version, and recover/reset/delete actions. Reset/delete requires confirmation that previous mappings will be abandoned.
+```javascript
+await ctx.rest('/providers/' + encodeURIComponent(providerId) + '/trust', {
+  method: 'PUT',
+  body: { trusted_local: nextTrusted }
+})
+```
+
+Sessions display profile/session ID, timestamps, snapshot state, mapping count, policy version, and recover/reset/delete actions. After confirmation, deletion uses:
+
+```javascript
+await ctx.rest(
+  '/sessions/' + encodeURIComponent(profileId) + '/' + encodeURIComponent(sessionId),
+  { method: 'DELETE' }
+)
+```
+
+Reset/delete confirmation text states that previous reversible mappings will be abandoned.
 
 - [ ] **Step 5: Add Review Focus reveal lifecycle tests**
 
