@@ -2149,21 +2149,56 @@ Reset/delete confirmation text states that previous reversible mappings will be 
 
 - [ ] **Step 5: Add Review Focus reveal lifecycle tests**
 
-Test UI state clears when:
-- 60-second expiry fires;
-- focused profile changes;
-- workspace component unmounts;
-- backend/gateway disconnects.
+Pin the UI reveal lifecycle in the source-contract test:
 
-The reveal body must not be copied into `ctx.storage`, React Query persistent cache, URL state, or logs.
+```javascript
+test('reveal state is ephemeral and auto-cleared', async () => {
+  const source = await readFile(new URL('../../desktop/plugin.js', import.meta.url), 'utf8')
+  assert.match(source, /REVEAL_TTL_MS\s*=\s*60_000/)
+  assert.match(source, /clearTimeout/)
+  assert.match(source, /focusedSessionProfile/)
+  assert.doesNotMatch(source, /ctx\.storage\.set\([^)]*reveal/i)
+})
+```
+
+Backend Task 11 tests enforce grant expiry and profile binding. Manual Desktop QA in Task 15 additionally verifies clearing on workspace unmount and backend/gateway disconnect.
 
 - [ ] **Step 6: Implement reveal control**
 
-The button requests `POST /events/{id}/reveal`, keeps returned sensitive data in component-local `useState`, schedules clearing, and clears in `useEffect` cleanup/profile/disconnect handlers.
+The button requests `POST /events/{id}/reveal`, keeps returned sensitive data only in component-local state, and schedules clearing:
+
+```javascript
+const REVEAL_TTL_MS = 60_000
+
+function useSensitiveReveal(profileId) {
+  const [revealed, setRevealed] = useState(null)
+
+  useEffect(() => {
+    setRevealed(null)
+  }, [profileId])
+
+  useEffect(() => {
+    if (!revealed) return undefined
+    const timer = setTimeout(() => setRevealed(null), REVEAL_TTL_MS)
+    return () => clearTimeout(timer)
+  }, [revealed])
+
+  return { revealed, setRevealed }
+}
+```
+
+The workspace also clears `revealed` when the backend/gateway connection state becomes disconnected. No reveal body enters query-cache persistence, URL state, logs, or `ctx.storage`.
 
 - [ ] **Step 7: Run Desktop tests**
 
-Expected: all editor, provider, session, and reveal lifecycle tests pass.
+Run:
+
+```bash
+node --check desktop/plugin.js
+npm run test:desktop
+```
+
+Expected: all editor, provider, session, and reveal contract tests pass.
 
 - [ ] **Step 8: Commit**
 
