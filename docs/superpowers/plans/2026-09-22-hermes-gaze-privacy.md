@@ -714,7 +714,55 @@ Unit tests use a fake provisioner and never perform network downloads.
 
 - [ ] **Step 7: Add open-source default policies**
 
-`policies/default.toml` must use Gaze schema `0.1.0`, bundled common PII rulepacks, reversible `tokenize` actions, conversation scope, and no organisation-specific classes. `strict.toml` may add a protective default action and stricter rulepack selection, but must remain restorable where the spec requires restoration.
+`policies/default.toml` uses the portable bundled `core` rulepack and reversible actions:
+
+```toml
+schema_version = "0.1.0"
+
+[session]
+scope = "conversation"
+
+[policy.rulepacks]
+bundled = ["core"]
+
+[[rule]]
+kind = "class"
+class = "email"
+action = "tokenize"
+
+[[rule]]
+kind = "class"
+class = "name"
+action = "tokenize"
+
+[[rule]]
+kind = "class"
+class = "location"
+action = "tokenize"
+
+[[rule]]
+kind = "class"
+class = "organization"
+action = "tokenize"
+```
+
+`policies/strict.toml` uses `core-extended` and a protective restorable default:
+
+```toml
+schema_version = "0.1.0"
+
+[session]
+scope = "conversation"
+
+[policy.rulepacks]
+bundled = ["core-extended"]
+
+[[rule]]
+kind = "default"
+action = "tokenize"
+```
+
+Neither file contains organisation-specific recognisers. NER remains enabled only when the effective policy has a verified model directory; first-run provisioning supplies that path through the profile/global policy setup flow rather than embedding a machine-specific path in the repository.
 
 - [ ] **Step 8: Run tests**
 
@@ -799,13 +847,68 @@ Use the same envelope pattern already exercised by Gaze's `gaze-mcp-bridge` file
 
 Never include `request_id` in the filename, AAD, or Gaze conversation scope. Never write plaintext snapshot bytes to disk.
 
+```rust
+const MAGIC: &[u8] = b"gaze-hermes-session-v1\n";
+const NONCE_LEN: usize = 12;
+
+fn namespace_bytes(key: &SessionKey) -> Vec<u8> {
+    let mut out = b"gaze-hermes-session-v1\0".to_vec();
+    out.extend_from_slice(key.profile_id.as_bytes());
+    out.push(0);
+    out.extend_from_slice(key.session_id.as_bytes());
+    out
+}
+
+fn encrypt_snapshot(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, StoreError> {
+    let cipher = ChaCha20Poly1305::new(key.into());
+    let mut nonce_bytes = [0_u8; NONCE_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    let ciphertext = cipher.encrypt(
+        Nonce::from_slice(&nonce_bytes),
+        Payload { msg: plaintext, aad },
+    ).map_err(|_| StoreError::Encrypt)?;
+    let mut out = Vec::with_capacity(MAGIC.len() + NONCE_LEN + ciphertext.len());
+    out.extend_from_slice(MAGIC);
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+```
+
 - [ ] **Step 4: Implement atomic persistence**
 
 Write to a sibling temporary file, `sync_all()`, then atomic rename. A stale temp file is ignored on read and may be cleaned on startup. The existing `.enc` remains authoritative until rename succeeds.
 
+```rust
+async fn persist_bytes(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+    use tokio::io::AsyncWriteExt;
+    let tmp = path.with_extension(format!("tmp-{}", random_hex(8)));
+    let mut file = tokio::fs::File::create(&tmp).await?;
+    file.write_all(bytes).await?;
+    file.sync_all().await?;
+    drop(file);
+    tokio::fs::rename(&tmp, path).await?;
+    Ok(())
+}
+```
+
 - [ ] **Step 5: Implement recovery refusal**
 
 If an encrypted snapshot exists but cannot decrypt/import, return a typed recovery error. Do not create a new session with the same namespace until the operator explicitly resets/deletes the broken snapshot.
+
+```rust
+match tokio::fs::read(&path).await {
+    Ok(ciphertext) => restore_snapshot(&master_key, &session_key, &ciphertext)
+        .map_err(StoreError::RecoveryBlocked),
+    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+        gaze::Session::new(gaze::Scope::Conversation(session_key.session_id.clone()))
+            .map_err(StoreError::Session)
+    }
+    Err(err) => Err(StoreError::Io(err)),
+}
+```
+
+`RecoveryBlocked` is surfaced by the API/UI until an explicit delete/reset operation removes the corrupt snapshot.
 
 - [ ] **Step 6: Run tests**
 
@@ -919,6 +1022,21 @@ Only commit after all fields succeed.
 - [ ] **Step 4: Implement strict restore**
 
 Restore every field with `Session::restore_strict_text`. Unknown/malformed owned-token syntax becomes a typed 422 privacy error, never a pass-through success.
+
+```rust
+let session_key = request.namespace.session_key();
+let handle = registry.get_or_restore(&session_key).await?;
+let session = handle.session.lock().await;
+let mut restored = Vec::with_capacity(request.fields.len());
+for field in &request.fields {
+    let text = session
+        .restore_strict_text(&field.text)
+        .map_err(PrivacyApiError::StrictRestore)?;
+    restored.push(TextField { path: field.path.clone(), text });
+}
+```
+
+Map `PrivacyApiError::StrictRestore` to HTTP 422 with a sanitised code such as `strict_restore_failed`; never include the raw text in the error body.
 
 - [ ] **Step 5: Return sanitised detection summaries**
 
