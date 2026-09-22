@@ -5,6 +5,7 @@ pub mod policies;
 pub mod privacy;
 pub mod sessions;
 pub mod status;
+pub mod streams;
 
 use axum::routing::{delete, get, post};
 use axum::Router;
@@ -21,6 +22,7 @@ pub struct AppState {
     pub policies: std::sync::Arc<PolicyStore>,
     pub sessions: std::sync::Arc<SessionRegistry>,
     pub metrics: std::sync::Arc<Metrics>,
+    pub streams: std::sync::Arc<crate::streaming::StreamManager>,
 }
 
 impl AppState {
@@ -29,12 +31,14 @@ impl AppState {
         policies: std::sync::Arc<PolicyStore>,
         sessions: std::sync::Arc<SessionRegistry>,
         metrics: std::sync::Arc<Metrics>,
+        streams: std::sync::Arc<crate::streaming::StreamManager>,
     ) -> Self {
         Self {
             auth,
             policies,
             sessions,
             metrics,
+            streams,
         }
     }
 }
@@ -166,6 +170,7 @@ pub fn build_router(state: AppState) -> Router {
             delete(sessions::delete_session),
         )
         .route("/v1/metrics", get(metrics::metrics_handler))
+        .route("/v1/streams/{stream_id}", get(streams::stream_ws))
         .layer(axum::middleware::from_fn_with_state(
             state.auth.clone(),
             require_bearer,

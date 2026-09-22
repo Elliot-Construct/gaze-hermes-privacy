@@ -7,6 +7,7 @@ use gaze_hermes_sidecar::api::{build_router, AppState, Metrics};
 use gaze_hermes_sidecar::auth::AuthState;
 use gaze_hermes_sidecar::policies::PolicyStore;
 use gaze_hermes_sidecar::sessions::SessionRegistry;
+use gaze_hermes_sidecar::streaming::StreamManager;
 use serde_json::Value;
 use tower::util::ServiceExt;
 
@@ -42,6 +43,7 @@ async fn test_app_in(token: &str, dir: &std::path::Path) -> axum::Router {
         policies,
         sessions,
         Arc::new(Metrics::default()),
+        Arc::new(StreamManager::default()),
     );
     build_router(state)
 }

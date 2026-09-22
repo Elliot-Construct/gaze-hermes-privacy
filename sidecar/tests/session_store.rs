@@ -223,7 +223,7 @@ async fn get_or_restore_round_trips_gaze_session() {
 
     let handle = registry.get_or_restore(&k).await.unwrap();
     {
-        let mut session = handle.session.lock().await;
+        let mut session = handle.session.lock().expect("session lock");
         let _ = &mut session;
     }
     registry.persist(&k).await.unwrap();

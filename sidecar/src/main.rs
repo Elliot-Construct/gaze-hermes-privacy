@@ -13,6 +13,7 @@ use gaze_hermes_sidecar::config::Config;
 use gaze_hermes_sidecar::policies::PolicyStore;
 use gaze_hermes_sidecar::protocol::PROTOCOL_VERSION;
 use gaze_hermes_sidecar::sessions::SessionRegistry;
+use gaze_hermes_sidecar::streaming::StreamManager;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -31,7 +32,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = config.bootstrap_data_dir()?;
     let policies = Arc::new(PolicyStore::open(&data_dir.join("policies"))?);
     let sessions = Arc::new(SessionRegistry::open(&data_dir.join("sessions"))?);
-    let state = AppState::new(auth, policies, sessions, Arc::new(Metrics::default()));
+    let state = AppState::new(
+        auth,
+        policies,
+        sessions,
+        Arc::new(Metrics::default()),
+        Arc::new(StreamManager::default()),
+    );
 
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     let local_addr: SocketAddr = listener.local_addr()?;

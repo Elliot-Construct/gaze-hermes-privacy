@@ -8,3 +8,4 @@ pub mod model;
 pub mod policies;
 pub mod protocol;
 pub mod sessions;
+pub mod streaming;

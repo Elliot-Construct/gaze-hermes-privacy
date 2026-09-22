@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
 pub use store::StoreError;
@@ -30,7 +29,7 @@ impl SessionKey {
 }
 
 pub struct SessionHandle {
-    pub session: Mutex<gaze::Session>,
+    pub session: std::sync::Mutex<gaze::Session>,
 }
 
 impl std::fmt::Debug for SessionHandle {
@@ -169,7 +168,7 @@ impl SessionRegistry {
         };
 
         let handle = Arc::new(SessionHandle {
-            session: Mutex::new(session),
+            session: std::sync::Mutex::new(session),
         });
         let mut handles = self.handles.lock().await;
         if let Some(existing) = handles.get(key) {
@@ -188,7 +187,7 @@ impl SessionRegistry {
                 .ok_or_else(|| StoreError::Session("no active session".into()))?
         };
         let plaintext = {
-            let session = handle.session.lock().await;
+                    let session = handle.session.lock().expect("session lock");
             session
                 .export()
                 .map_err(|err| StoreError::Session(err.to_string()))?
@@ -302,7 +301,7 @@ impl SessionRegistry {
             let handles = self.handles.lock().await;
             match handles.get(key) {
                 Some(handle) => {
-                    let session = handle.session.lock().await;
+            let session = handle.session.lock().expect("session lock");
                     session.tokens().len()
                 }
                 None => 0,

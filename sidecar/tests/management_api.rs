@@ -7,6 +7,7 @@ use gaze_hermes_sidecar::api::{build_router, AppState, Metrics};
 use gaze_hermes_sidecar::auth::AuthState;
 use gaze_hermes_sidecar::policies::{PolicyScope, PolicyStore};
 use gaze_hermes_sidecar::sessions::{snapshot_path, SessionKey, SessionRegistry};
+use gaze_hermes_sidecar::streaming::StreamManager;
 use serde_json::Value;
 use tower::util::ServiceExt;
 
@@ -40,6 +41,7 @@ fn test_state(dir: &std::path::Path) -> AppState {
         policies,
         sessions,
         Arc::new(Metrics::default()),
+        Arc::new(StreamManager::default()),
     )
 }
 

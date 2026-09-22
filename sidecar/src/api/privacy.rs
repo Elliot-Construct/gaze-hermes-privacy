@@ -63,31 +63,33 @@ async fn run_clean(state: &AppState, request: CleanRequest) -> Result<CleanRespo
     let session_key = request.namespace.session_key();
     let effective = super::effective_for_profile(&state.policies, &request.namespace.profile_id)?;
     let handle = state.sessions.get_or_restore(&session_key).await?;
-    let session = handle.session.lock().await;
     let locale_tags = super::locale_tags_for(&effective.policy);
     let dictionaries = gaze::DictionaryBundle::default();
-    let mut tx = session.begin_transaction();
-    let mut cleaned = Vec::with_capacity(request.fields.len());
-    let mut detections: Vec<DetectionCount> = Vec::new();
+    let (cleaned, detections) = {
+        let session = handle.session.lock().expect("session lock");
+        let mut tx = session.begin_transaction();
+        let mut cleaned = Vec::with_capacity(request.fields.len());
+        let mut detections: Vec<DetectionCount> = Vec::new();
 
-    for field in &request.fields {
-        let text = effective
-            .pipeline
-            .protect_text_transaction(
-                &mut tx,
-                &field.text,
-                gaze::ProtectionContext::strict(&locale_tags, &dictionaries),
-            )
-            .map_err(|_| ApiError::Privacy)?;
-        collect_detections(&field.text, &text, &mut detections);
-        cleaned.push(TextField {
-            path: field.path.clone(),
-            text,
-        });
-    }
+        for field in &request.fields {
+            let text = effective
+                .pipeline
+                .protect_text_transaction(
+                    &mut tx,
+                    &field.text,
+                    gaze::ProtectionContext::strict(&locale_tags, &dictionaries),
+                )
+                .map_err(|_| ApiError::Privacy)?;
+            collect_detections(&field.text, &text, &mut detections);
+            cleaned.push(TextField {
+                path: field.path.clone(),
+                text,
+            });
+        }
 
-    tx.commit().map_err(|_| ApiError::Privacy)?;
-    drop(session);
+        tx.commit().map_err(|_| ApiError::Privacy)?;
+        (cleaned, detections)
+    };
     state.sessions.persist(&session_key).await?;
 
     Ok(CleanResponse {
@@ -100,18 +102,20 @@ async fn run_clean(state: &AppState, request: CleanRequest) -> Result<CleanRespo
 async fn run_restore(state: &AppState, request: RestoreRequest) -> Result<RestoreResponse, ApiError> {
     let session_key = request.namespace.session_key();
     let handle = state.sessions.get_or_restore(&session_key).await?;
-    let session = handle.session.lock().await;
-    let mut restored = Vec::with_capacity(request.fields.len());
-    for field in &request.fields {
-        let text = session
-            .restore_strict_text(&field.text)
-            .map_err(|_| ApiError::StrictRestore)?;
-        restored.push(TextField {
-            path: field.path.clone(),
-            text,
-        });
-    }
-    drop(session);
+    let restored = {
+        let session = handle.session.lock().expect("session lock");
+        let mut restored = Vec::with_capacity(request.fields.len());
+        for field in &request.fields {
+            let text = session
+                .restore_strict_text(&field.text)
+                .map_err(|_| ApiError::StrictRestore)?;
+            restored.push(TextField {
+                path: field.path.clone(),
+                text,
+            });
+        }
+        restored
+    };
     Ok(RestoreResponse { fields: restored })
 }
 
