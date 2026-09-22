@@ -478,6 +478,7 @@ git commit -m "feat: scaffold Hermes privacy plugin"
 
 **Files:**
 - Create: `sidecar/Cargo.toml`
+- Create: `sidecar/Cargo.lock`
 - Create: `sidecar/src/main.rs`
 - Create: `sidecar/src/config.rs`
 - Create: `sidecar/src/auth.rs`
@@ -518,7 +519,7 @@ async fn health_is_minimal_and_protocol_is_explicit() {
 
 - [ ] **Step 2: Add pinned Rust dependencies**
 
-`sidecar/Cargo.toml` must set `rust-version = "1.89"` and include:
+`sidecar/Cargo.toml` must set `rust-version = "1.89"` and include the dependencies below. Run `cargo generate-lockfile --manifest-path sidecar/Cargo.toml` after dependency resolution and commit `sidecar/Cargo.lock`; every later CI/Docker/release Cargo command uses `--locked`.
 
 ```toml
 [dependencies]
@@ -1858,6 +1859,7 @@ git commit -m "feat: enforce Gaze around Hermes LLM calls"
 - Produces: Desktop-safe REST namespace:
   - `GET /status`
   - `GET /events`
+  - `WS /events`
   - `GET/PUT /policies/global`
   - `GET/PUT /policies/profiles/{profile_id}`
   - `POST /policies/validate`
@@ -1938,12 +1940,25 @@ def status():
 def events(limit: int = 100):
     return {"events": service.events.list(limit=min(max(limit, 1), 500))}
 
+@router.websocket("/events")
+async def events_socket(websocket: WebSocket):
+    if not ws_upgrade_authorized(websocket):
+        await websocket.close(code=4401)
+        return
+    await websocket.accept()
+    subscription = service.events.subscribe()
+    try:
+        async for event in subscription:
+            await websocket.send_json(event.sanitised_dict())
+    finally:
+        subscription.close()
+
 @router.post("/policies/validate")
 def validate_policy(request: PolicyTextRequest):
     return service.validate_policy(request)
 ```
 
-Every route delegates to typed service methods. Router exceptions are converted to sanitised HTTP errors that contain codes/metadata only, never sensitive request bodies.
+Every route delegates to typed service methods. `ws_upgrade_authorized` delegates to Hermes' canonical dashboard WebSocket auth gate, matching the built-in plugin pattern. Router exceptions and WebSocket error frames contain codes/metadata only, never sensitive request bodies. Add a TestClient WebSocket test that receives one event and asserts synthetic PII is absent.
 
 - [ ] **Step 5: Implement bounded sanitised event storage**
 
@@ -2505,7 +2520,7 @@ git commit -m "build: add verified sidecar release pipeline"
 - Create: `tests/e2e/test_tool_restore.py`
 - Create: `tests/e2e/test_remote_profile_isolation.py`
 - Create: `tests/e2e/test_logging.py`
-- Create: `README.md`
+- Modify: `README.md`
 - Create: `SECURITY.md`
 - Create: `docs/architecture.md`
 - Create: `docs/install.md`
