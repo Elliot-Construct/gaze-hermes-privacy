@@ -1510,23 +1510,80 @@ def test_external_provider_receives_only_cleaned_request(runtime):
 
 - [ ] **Step 2: Add fallback trust regression test**
 
-Simulate consecutive Hermes attempts:
-1. `local-vllm` explicitly trusted, no sidecar clean call;
-2. fallback `openrouter`, sidecar clean required;
-3. second external fallback `anthropic`, sidecar clean required again.
+Simulate consecutive Hermes attempts and assert trust is re-evaluated every time:
 
-Assert trust is evaluated from the provider argument on each middleware invocation.
+```python
+def test_fallback_rechecks_provider_trust(runtime):
+    runtime.provider_policy = ProviderPolicy(frozenset({"local-vllm"}))
+    calls = []
+
+    runtime.execute(
+        provider="local-vllm",
+        next_call=lambda request: calls.append(("local", request)) or fake_response(),
+        request=payload(),
+        api_mode="chat_completions",
+        session_id="s1",
+        api_request_id="r1",
+    )
+    runtime.execute(
+        provider="openrouter",
+        next_call=lambda request: calls.append(("openrouter", request)) or fake_response(),
+        request=payload(),
+        api_mode="chat_completions",
+        session_id="s1",
+        api_request_id="r2",
+    )
+    runtime.execute(
+        provider="anthropic",
+        next_call=lambda request: calls.append(("anthropic", request)) or fake_response(),
+        request=payload(),
+        api_mode="chat_completions",
+        session_id="s1",
+        api_request_id="r3",
+    )
+
+    assert runtime.fake_sidecar.clean_calls == 2
+    assert [name for name, _ in calls] == ["local", "openrouter", "anthropic"]
+```
 
 - [ ] **Step 3: Add mandatory compatibility tests**
 
-Feature detection checks both:
-- `register_middleware` accepts `failure_mode`;
-- Hermes exports/accepts `llm_stream_text`.
+Feature detection checks both `register_middleware` accepting `failure_mode` and Hermes accepting the `llm_stream_text` kind:
 
-Without both capabilities:
-- external provider + mandatory mode => `PrivacyBlockedError`;
-- trusted-local => bypass;
-- explicit compatibility mode => external call may proceed but event state is `protection_not_guaranteed`.
+```python
+def test_missing_hermes_privacy_capabilities_block_external(runtime):
+    runtime.capabilities = HermesCapabilities(fail_closed=False, stream_text=False)
+    runtime.config = replace(runtime.config, mandatory_mode=True)
+    with pytest.raises(PrivacyBlockedError):
+        runtime.execute(
+            provider="openrouter",
+            next_call=lambda request: pytest.fail("provider must not be called"),
+            request=payload(),
+            api_mode="chat_completions",
+            session_id="s1",
+            api_request_id="r1",
+        )
+
+
+def test_missing_capabilities_still_allow_explicit_trusted_local(runtime):
+    runtime.capabilities = HermesCapabilities(fail_closed=False, stream_text=False)
+    runtime.provider_policy = ProviderPolicy(frozenset({"local-vllm"}))
+    assert runtime.protection_decision("local-vllm") == "bypass"
+
+
+def test_compatibility_mode_marks_external_call_not_guaranteed(runtime):
+    runtime.capabilities = HermesCapabilities(fail_closed=False, stream_text=False)
+    runtime.config = replace(runtime.config, mandatory_mode=False, compatibility_mode=True)
+    runtime.execute(
+        provider="openrouter",
+        next_call=lambda request: fake_response(),
+        request=payload(),
+        api_mode="chat_completions",
+        session_id="s1",
+        api_request_id="r1",
+    )
+    assert runtime.events.last().state == "protection_not_guaranteed"
+```
 
 - [ ] **Step 4: Run tests and verify failure**
 
