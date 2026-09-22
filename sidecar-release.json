@@ -1,0 +1,35 @@
+{
+  "protocol_version": 1,
+  "artifacts": [
+    {
+      "os": "linux",
+      "arch": "x86_64",
+      "url": "https://example.invalid/sidecar-linux-x86_64",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "os": "linux",
+      "arch": "aarch64",
+      "url": "https://example.invalid/sidecar-linux-aarch64",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "os": "darwin",
+      "arch": "x86_64",
+      "url": "https://example.invalid/sidecar-darwin-x86_64",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "os": "darwin",
+      "arch": "aarch64",
+      "url": "https://example.invalid/sidecar-darwin-aarch64",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "os": "windows",
+      "arch": "x86_64",
+      "url": "https://example.invalid/sidecar-windows-x86_64.exe",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ]
+}
