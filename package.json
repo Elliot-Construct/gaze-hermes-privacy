@@ -1,0 +1,7 @@
+{
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:desktop": "node --test tests/desktop/*.test.mjs"
+  }
+}
