@@ -1,5 +1,7 @@
 # Hermes Gaze Privacy Implementation Plan
 
+**Status:** Ready for review; implementation has not started.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build a standalone open-source Hermes plugin that reversibly pseudonymises PII before external LLM calls, restores responses locally before Hermes parses them, preserves live streaming, and exposes a native Hermes Desktop privacy console.
@@ -1434,7 +1436,12 @@ class SidecarClient:
         return response.json()
 
     def open_stream(self, namespace: dict) -> "StreamClient":
-        ws_url = self.base_url.replace("http://", "ws://", 1) + "/v1/streams/new"
+        stream_id = uuid.uuid4().hex
+        ws_url = (
+            self.base_url.replace("http://", "ws://", 1)
+            + "/v1/streams/"
+            + stream_id
+        )
         return StreamClient.connect(ws_url, self.headers, namespace)
 ```
 
