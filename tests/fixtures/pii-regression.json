@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "email-markdown",
+      "text": "Contact Ada Example at ada@example.invalid in York.",
+      "must_protect": ["Ada Example", "ada@example.invalid", "York"]
+    },
+    {
+      "id": "custom-order-json",
+      "text": "{\"customer\":\"Synthetic Person\",\"order\":\"ORD-123456\"}",
+      "must_protect": ["Synthetic Person", "ORD-123456"]
+    },
+    {
+      "id": "latex-tool",
+      "text": "\\author{Synthetic Author}\\email{author@example.invalid}",
+      "must_protect": ["Synthetic Author", "author@example.invalid"]
+    },
+    {
+      "id": "phone-us",
+      "text": "Call Synthetic Person at +1-555-123-4567.",
+      "must_protect": ["Synthetic Person", "+1-555-123-4567"]
+    },
+    {
+      "id": "postal-location",
+      "text": "Ship to Synthetic Corp, 123 Main St, Springfield, IL 62701.",
+      "must_protect": ["Synthetic Corp", "123 Main St", "Springfield", "IL", "62701"]
+    },
+    {
+      "id": "organization",
+      "text": "Synthetic Corp announced earnings.",
+      "must_protect": ["Synthetic Corp"]
+    },
+    {
+      "id": "multilingual-spanish",
+      "text": "Contactar a Juan Pérez en juan.perez@example.invalid.",
+      "must_protect": ["Juan Pérez", "juan.perez@example.invalid"]
+    },
+    {
+      "id": "xml-payload",
+      "text": "<user><name>Synthetic User</name><email>user@example.invalid</email></user>",
+      "must_protect": ["Synthetic User", "user@example.invalid"]
+    },
+    {
+      "id": "source-code",
+      "text": "def send_email(to='admin@example.invalid'): pass",
+      "must_protect": ["admin@example.invalid"]
+    },
+    {
+      "id": "nested-payload",
+      "text": "{\"data\": {\"user\": {\"name\": \"Nested User\", \"contact\": {\"email\": \"nested@example.invalid\"}}}}",
+      "must_protect": ["Nested User", "nested@example.invalid"]
+    },
+    {
+      "id": "tool-call",
+      "text": "{\"tool\": \"write_file\", \"args\": {\"path\": \"out.txt\", \"content\": \"Hello Synthetic User\"}}",
+      "must_protect": ["Synthetic User"]
+    },
+    {
+      "id": "stream-split",
+      "text": "The token <tok is split across chunks",
+      "must_protect": ["tok"]
+    }
+  ]
+}

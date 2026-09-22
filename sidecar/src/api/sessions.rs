@@ -17,10 +17,14 @@ pub async fn get_session(
     Path((profile_id, session_id)): Path<(String, String)>,
 ) -> Result<Json<crate::sessions::SessionMetadata>, ApiError> {
     let key = SessionKey::new(profile_id, session_id);
-    let metadata = state.sessions.metadata(&key).await.map_err(|err| match err {
-        crate::sessions::StoreError::Session(_) => ApiError::NotFound,
-        other => other.into(),
-    })?;
+    let metadata = state
+        .sessions
+        .metadata(&key)
+        .await
+        .map_err(|err| match err {
+            crate::sessions::StoreError::Session(_) => ApiError::NotFound,
+            other => other.into(),
+        })?;
     Ok(Json(metadata))
 }
 
@@ -38,10 +42,7 @@ pub async fn delete_session(
     Path((profile_id, session_id)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     let key = SessionKey::new(profile_id, session_id);
-    let path = crate::sessions::snapshot_path(
-        &state.sessions.dir(),
-        &key,
-    );
+    let path = crate::sessions::snapshot_path(state.sessions.dir(), &key);
     if !path.exists() && state.sessions.metadata(&key).await.is_err() {
         return Err(ApiError::NotFound);
     }

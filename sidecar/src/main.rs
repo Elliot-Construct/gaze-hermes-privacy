@@ -19,8 +19,7 @@ use gaze_hermes_sidecar::streaming::StreamManager;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -59,10 +58,7 @@ fn write_ready_file(path: &Path, addr: SocketAddr) -> std::io::Result<()> {
             std::fs::create_dir_all(parent)?;
         }
     }
-    let tmp = path.with_extension(format!(
-        "tmp-{}",
-        std::process::id()
-    ));
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
     let payload = serde_json::json!({
         "address": addr.to_string(),
         "protocol_version": PROTOCOL_VERSION,

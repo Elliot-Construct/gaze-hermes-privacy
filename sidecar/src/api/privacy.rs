@@ -14,10 +14,7 @@ pub async fn clean(
     Json(request): Json<CleanRequest>,
 ) -> Result<Json<CleanResponse>, ApiError> {
     let started = Instant::now();
-    state
-        .metrics
-        .clean_requests
-        .fetch_add(1, Ordering::Relaxed);
+    state.metrics.clean_requests.fetch_add(1, Ordering::Relaxed);
     match run_clean(&state, request).await {
         Ok(response) => {
             observe_latency(
@@ -99,7 +96,10 @@ async fn run_clean(state: &AppState, request: CleanRequest) -> Result<CleanRespo
     })
 }
 
-async fn run_restore(state: &AppState, request: RestoreRequest) -> Result<RestoreResponse, ApiError> {
+async fn run_restore(
+    state: &AppState,
+    request: RestoreRequest,
+) -> Result<RestoreResponse, ApiError> {
     let session_key = request.namespace.session_key();
     let handle = state.sessions.get_or_restore(&session_key).await?;
     let restored = {
@@ -172,5 +172,3 @@ fn merge_detections(detections: Vec<DetectionCount>) -> Vec<DetectionCount> {
     }
     merged
 }
-
-

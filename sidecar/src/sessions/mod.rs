@@ -77,11 +77,9 @@ fn write_index(
     index: &std::collections::HashSet<SessionKey>,
 ) -> Result<(), StoreError> {
     let mut entries: Vec<SessionKey> = index.iter().cloned().collect();
-    entries.sort_by(|a, b| {
-        (&a.profile_id, &a.session_id).cmp(&(&b.profile_id, &b.session_id))
-    });
-    let bytes = serde_json::to_vec_pretty(&entries)
-        .map_err(|err| StoreError::Session(err.to_string()))?;
+    entries.sort_by(|a, b| (&a.profile_id, &a.session_id).cmp(&(&b.profile_id, &b.session_id)));
+    let bytes =
+        serde_json::to_vec_pretty(&entries).map_err(|err| StoreError::Session(err.to_string()))?;
     persist_bytes(&index_path(dir), &bytes, false)
 }
 
@@ -123,10 +121,7 @@ impl SessionRegistry {
         &self.dir
     }
 
-    pub async fn get_or_restore(
-        &self,
-        key: &SessionKey,
-    ) -> Result<Arc<SessionHandle>, StoreError> {
+    pub async fn get_or_restore(&self, key: &SessionKey) -> Result<Arc<SessionHandle>, StoreError> {
         {
             let handles = self.handles.lock().await;
             if let Some(handle) = handles.get(key) {
@@ -187,7 +182,7 @@ impl SessionRegistry {
                 .ok_or_else(|| StoreError::Session("no active session".into()))?
         };
         let plaintext = {
-                    let session = handle.session.lock().expect("session lock");
+            let session = handle.session.lock().expect("session lock");
             session
                 .export()
                 .map_err(|err| StoreError::Session(err.to_string()))?
@@ -265,9 +260,7 @@ impl SessionRegistry {
             .iter()
             .cloned()
             .collect();
-        keys.sort_by(|a, b| {
-            (&a.profile_id, &a.session_id).cmp(&(&b.profile_id, &b.session_id))
-        });
+        keys.sort_by(|a, b| (&a.profile_id, &a.session_id).cmp(&(&b.profile_id, &b.session_id)));
         let mut out = Vec::with_capacity(keys.len());
         for key in keys {
             out.push(self.metadata_inner(&key).await);
@@ -301,7 +294,7 @@ impl SessionRegistry {
             let handles = self.handles.lock().await;
             match handles.get(key) {
                 Some(handle) => {
-            let session = handle.session.lock().expect("session lock");
+                    let session = handle.session.lock().expect("session lock");
                     session.tokens().len()
                 }
                 None => 0,
@@ -347,7 +340,7 @@ pub(crate) fn persist_bytes(
         .unwrap_or("snapshot");
     let tmp = path.with_file_name(format!(
         "{file_stem}.tmp-{}",
-        hex::encode(&rand::random::<[u8; 4]>())
+        hex::encode(rand::random::<[u8; 4]>())
     ));
     std::fs::write(&tmp, bytes)?;
     {
@@ -359,8 +352,7 @@ pub(crate) fn persist_bytes(
     }
     if fail_before_rename {
         let _ = std::fs::remove_file(&tmp);
-        return Err(StoreError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(StoreError::Io(std::io::Error::other(
             "simulated failure before rename",
         )));
     }

@@ -86,9 +86,7 @@ impl PolicyStore {
                 if path.extension().and_then(|e| e.to_str()) == Some("toml") {
                     if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                         let id = stem.to_string();
-                        if let Err(err) = validate_profile_id(&id) {
-                            return Err(err);
-                        }
+                        validate_profile_id(&id)?;
                         profiles.insert(id, std::fs::read_to_string(&path)?);
                     }
                 }
@@ -105,14 +103,16 @@ impl PolicyStore {
         };
 
         let global_eff = store.build_effective(&global)?;
-        store
+        store.data.lock().unwrap().cache.insert(None, global_eff);
+
+        let ids: Vec<String> = store
             .data
             .lock()
             .unwrap()
-            .cache
-            .insert(None, global_eff);
-
-        let ids: Vec<String> = store.data.lock().unwrap().profiles.keys().cloned().collect();
+            .profiles
+            .keys()
+            .cloned()
+            .collect();
         for id in ids {
             let overlay = store.data.lock().unwrap().profiles[&id].clone();
             let merged = merge_policy_documents(&global, &overlay)?;
@@ -225,25 +225,26 @@ impl PolicyStore {
             }
         };
 
-        let profile_rebuilds: Result<Vec<(String, EffectivePolicy)>, PolicyStoreError> = match &scope {
-            PolicyScope::Global => {
-                let overlays: Vec<(String, String)> = {
-                    let data = self.data.lock().unwrap();
-                    data.profiles
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect()
-                };
-                let mut out = Vec::new();
-                for (id, overlay) in overlays {
-                    let merged = merge_policy_documents(raw_toml, &overlay)?;
-                    let eff = self.try_build(&merged)?;
-                    out.push((id, eff));
+        let profile_rebuilds: Result<Vec<(String, EffectivePolicy)>, PolicyStoreError> =
+            match &scope {
+                PolicyScope::Global => {
+                    let overlays: Vec<(String, String)> = {
+                        let data = self.data.lock().unwrap();
+                        data.profiles
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect()
+                    };
+                    let mut out = Vec::new();
+                    for (id, overlay) in overlays {
+                        let merged = merge_policy_documents(raw_toml, &overlay)?;
+                        let eff = self.try_build(&merged)?;
+                        out.push((id, eff));
+                    }
+                    Ok(out)
                 }
-                Ok(out)
-            }
-            PolicyScope::Profile(_) => Ok(Vec::new()),
-        };
+                PolicyScope::Profile(_) => Ok(Vec::new()),
+            };
         let profile_rebuilds = profile_rebuilds?;
 
         atomic_write(&self.path_for(&scope), raw_toml.as_bytes())?;
@@ -298,17 +299,11 @@ impl PolicyStore {
         }
     }
 
-    fn build_effective(
-        &self,
-        effective_toml: &str,
-    ) -> Result<EffectivePolicy, PolicyStoreError> {
+    fn build_effective(&self, effective_toml: &str) -> Result<EffectivePolicy, PolicyStoreError> {
         self.try_build(effective_toml)
     }
 
-    fn try_build(
-        &self,
-        effective_toml: &str,
-    ) -> Result<EffectivePolicy, PolicyStoreError> {
+    fn try_build(&self, effective_toml: &str) -> Result<EffectivePolicy, PolicyStoreError> {
         let (policy, pipeline) = self.try_build_inner(effective_toml)?;
         Ok(EffectivePolicy {
             hash: sha256_hex(effective_toml.as_bytes()),
@@ -341,8 +336,8 @@ fn load_and_build(
     path: &Path,
     store_dir: &Path,
 ) -> Result<(gaze::Policy, Arc<gaze::Pipeline>), PolicyStoreError> {
-    let policy = gaze::Policy::load(path)
-        .map_err(|err| PolicyStoreError::Policy(err.to_string()))?;
+    let policy =
+        gaze::Policy::load(path).map_err(|err| PolicyStoreError::Policy(err.to_string()))?;
 
     let mut rulepacks = Vec::new();
     for name in policy.rulepacks.bundled.clone() {
@@ -387,8 +382,9 @@ fn load_and_build(
         fields: Default::default(),
     };
 
-    let pipeline = gaze_assembly::build_pipeline(&policy, &context, &rulepacks, &locale_chain, None)
-        .map_err(|err| PolicyStoreError::Build(err.to_string()))?;
+    let pipeline =
+        gaze_assembly::build_pipeline(&policy, &context, &rulepacks, &locale_chain, None)
+            .map_err(|err| PolicyStoreError::Build(err.to_string()))?;
 
     Ok((policy, Arc::new(pipeline)))
 }
@@ -514,9 +510,9 @@ fn global_contains_recognizer(global: &str, name: &str) -> bool {
     doc.get("policy")
         .and_then(|p| p.get("custom_recognizers"))
         .map(|item| {
-            merge::item_to_values(Some(item)).iter().any(|value| {
-                merge::value_str(value, "name") == Some(name)
-            })
+            merge::item_to_values(Some(item))
+                .iter()
+                .any(|value| merge::value_str(value, "name") == Some(name))
         })
         .unwrap_or(false)
 }
@@ -577,7 +573,9 @@ fn remove_rule(doc: &mut DocumentMut, identity: &str) -> Result<(), PolicyStoreE
     Ok(())
 }
 
-fn policy_table_mut(doc: &mut DocumentMut) -> Result<&mut dyn toml_edit::TableLike, PolicyStoreError> {
+fn policy_table_mut(
+    doc: &mut DocumentMut,
+) -> Result<&mut dyn toml_edit::TableLike, PolicyStoreError> {
     if !doc.contains_key("policy") {
         doc.insert("policy", Item::Table(Table::new()));
     }
@@ -593,7 +591,10 @@ fn read_recognizer_values(doc: &DocumentMut) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-fn write_recognizer_values(doc: &mut DocumentMut, values: Vec<Value>) -> Result<(), PolicyStoreError> {
+fn write_recognizer_values(
+    doc: &mut DocumentMut,
+    values: Vec<Value>,
+) -> Result<(), PolicyStoreError> {
     let policy = policy_table_mut(doc)?;
     let mut array = Array::new();
     for value in values {

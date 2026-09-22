@@ -34,15 +34,14 @@ async fn handle_socket(state: AppState, stream_id: String, mut socket: WebSocket
                             send_err(&mut socket, "stream_already_open").await;
                             continue;
                         }
-                        let namespace: RequestNamespace = match serde_json::from_value(
-                            parsed["namespace"].clone(),
-                        ) {
-                            Ok(ns) => ns,
-                            Err(_) => {
-                                send_err(&mut socket, "invalid_namespace").await;
-                                continue;
-                            }
-                        };
+                        let namespace: RequestNamespace =
+                            match serde_json::from_value(parsed["namespace"].clone()) {
+                                Ok(ns) => ns,
+                                Err(_) => {
+                                    send_err(&mut socket, "invalid_namespace").await;
+                                    continue;
+                                }
+                            };
                         match open_restorer(&state, &namespace).await {
                             Ok(restorer) => match state.streams.open(&stream_id, restorer) {
                                 Ok(()) => {
@@ -56,7 +55,7 @@ async fn handle_socket(state: AppState, stream_id: String, mut socket: WebSocket
                                 }
                                 Err(err) => send_err(&mut socket, err.code()).await,
                             },
-                            Err(code) => send_err(&mut socket, &code).await,
+                            Err(code) => send_err(&mut socket, code).await,
                         }
                     }
                     Some("chunk") if opened && !finished => {

@@ -92,12 +92,38 @@ async fn every_management_route_requires_bearer() {
 
     let cases: Vec<(&str, &str, Option<Value>)> = vec![
         ("GET", "/v1/status", None),
-        ("POST", "/v1/clean", Some(serde_json::json!({"namespace": namespace("s"), "fields": []}))),
-        ("POST", "/v1/restore", Some(serde_json::json!({"namespace": namespace("s"), "fields": []}))),
-        ("POST", "/v1/policies/validate", Some(serde_json::json!({"toml": ""}))),
-        ("POST", "/v1/policies/test", Some(serde_json::json!({"namespace": namespace("s"), "fields": []}))),
-        ("POST", "/v1/policies/edit", Some(serde_json::json!({"scope": "global", "expected_hash": "", "edit": {"UpsertRule": {"kind": "class", "class": "email", "action": "tokenize"}}}))),
-        ("POST", "/v1/policies/apply", Some(serde_json::json!({"scope": "global", "expected_hash": "", "toml": ""}))),
+        (
+            "POST",
+            "/v1/clean",
+            Some(serde_json::json!({"namespace": namespace("s"), "fields": []})),
+        ),
+        (
+            "POST",
+            "/v1/restore",
+            Some(serde_json::json!({"namespace": namespace("s"), "fields": []})),
+        ),
+        (
+            "POST",
+            "/v1/policies/validate",
+            Some(serde_json::json!({"toml": ""})),
+        ),
+        (
+            "POST",
+            "/v1/policies/test",
+            Some(serde_json::json!({"namespace": namespace("s"), "fields": []})),
+        ),
+        (
+            "POST",
+            "/v1/policies/edit",
+            Some(
+                serde_json::json!({"scope": "global", "expected_hash": "", "edit": {"UpsertRule": {"kind": "class", "class": "email", "action": "tokenize"}}}),
+            ),
+        ),
+        (
+            "POST",
+            "/v1/policies/apply",
+            Some(serde_json::json!({"scope": "global", "expected_hash": "", "toml": ""})),
+        ),
         ("GET", "/v1/policies/effective", None),
         ("GET", "/v1/sessions", None),
         ("GET", "/v1/sessions/p/s", None),
@@ -124,10 +150,8 @@ async fn invalid_policy_apply_leaves_active_hash_unchanged() {
     let dir = temp_dir("invalid-apply");
     let state = test_state(&dir);
 
-    let before = body_json(
-        send(app(&state), "GET", "/v1/policies/effective", true, None).await,
-    )
-    .await;
+    let before =
+        body_json(send(app(&state), "GET", "/v1/policies/effective", true, None).await).await;
     let hash = before["hash"].as_str().unwrap().to_string();
 
     let invalid = serde_json::json!({
@@ -135,13 +159,18 @@ async fn invalid_policy_apply_leaves_active_hash_unchanged() {
         "expected_hash": hash,
         "toml": "schema_version = \"0.2.0\"\n",
     });
-    let response = send(app(&state), "POST", "/v1/policies/apply", true, Some(&invalid)).await;
-    assert_ne!(response.status(), StatusCode::OK);
-
-    let after = body_json(
-        send(app(&state), "GET", "/v1/policies/effective", true, None).await,
+    let response = send(
+        app(&state),
+        "POST",
+        "/v1/policies/apply",
+        true,
+        Some(&invalid),
     )
     .await;
+    assert_ne!(response.status(), StatusCode::OK);
+
+    let after =
+        body_json(send(app(&state), "GET", "/v1/policies/effective", true, None).await).await;
     assert_eq!(before["hash"], after["hash"]);
 }
 
@@ -155,7 +184,14 @@ async fn stale_expected_hash_returns_conflict() {
         "expected_hash": "deadbeef",
         "toml": gaze_hermes_sidecar::config::DEFAULT_GLOBAL_POLICY,
     });
-    let response = send(app(&state), "POST", "/v1/policies/apply", true, Some(&request)).await;
+    let response = send(
+        app(&state),
+        "POST",
+        "/v1/policies/apply",
+        true,
+        Some(&request),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
 }
 
@@ -179,7 +215,14 @@ async fn session_list_and_get_never_leak_raw_values() {
     assert!(!raw.contains("tokens"));
 
     let single = body_json(
-        send(app(&state), "GET", "/v1/sessions/default/leak-1", true, None).await,
+        send(
+            app(&state),
+            "GET",
+            "/v1/sessions/default/leak-1",
+            true,
+            None,
+        )
+        .await,
     )
     .await;
     let raw = serde_json::to_string(&single).unwrap();
@@ -206,7 +249,14 @@ async fn delete_session_removes_snapshot() {
     let path = snapshot_path(&dir.join("sessions"), &key);
     assert!(path.exists());
 
-    let response = send(app(&state), "DELETE", "/v1/sessions/default/del-1", true, None).await;
+    let response = send(
+        app(&state),
+        "DELETE",
+        "/v1/sessions/default/del-1",
+        true,
+        None,
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert!(!path.exists());
 
@@ -245,7 +295,14 @@ async fn recover_reports_success_for_existing_session() {
     let response = send(app(&state), "POST", "/v1/clean", true, Some(&clean)).await;
     assert_eq!(response.status(), StatusCode::OK);
 
-    let response = send(app(&state), "POST", "/v1/sessions/default/r-1/recover", true, None).await;
+    let response = send(
+        app(&state),
+        "POST",
+        "/v1/sessions/default/r-1/recover",
+        true,
+        None,
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
     assert_eq!(body["recovered"], true);
@@ -256,10 +313,8 @@ async fn policy_edit_returns_candidate_without_changing_active() {
     let dir = temp_dir("edit-candidate");
     let state = test_state(&dir);
 
-    let before = body_json(
-        send(app(&state), "GET", "/v1/policies/effective", true, None).await,
-    )
-    .await;
+    let before =
+        body_json(send(app(&state), "GET", "/v1/policies/effective", true, None).await).await;
     let hash = before["hash"].as_str().unwrap().to_string();
 
     let edit = serde_json::json!({
@@ -272,10 +327,8 @@ async fn policy_edit_returns_candidate_without_changing_active() {
     let candidate = body_json(response).await;
     assert!(candidate["toml"].as_str().unwrap().contains("phone"));
 
-    let after = body_json(
-        send(app(&state), "GET", "/v1/policies/effective", true, None).await,
-    )
-    .await;
+    let after =
+        body_json(send(app(&state), "GET", "/v1/policies/effective", true, None).await).await;
     assert_eq!(before["hash"], after["hash"]);
     assert!(!after["toml"].as_str().unwrap().contains("phone"));
 }

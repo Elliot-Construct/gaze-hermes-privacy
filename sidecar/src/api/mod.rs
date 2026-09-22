@@ -93,10 +93,7 @@ impl axum::response::IntoResponse for ApiError {
             serde_json::Value::String(self.code().to_string()),
         );
         if let ApiError::Validation(message) = &self {
-            body.insert(
-                "message".into(),
-                serde_json::Value::String(message.clone()),
-            );
+            body.insert("message".into(), serde_json::Value::String(message.clone()));
         }
         (status, Json(serde_json::Value::Object(body))).into_response()
     }
@@ -160,7 +157,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/policies/apply", post(policies::apply_policy))
         .route("/v1/policies/effective", get(policies::effective_policy))
         .route("/v1/sessions", get(sessions::list_sessions))
-        .route("/v1/sessions/{profile}/{session}", get(sessions::get_session))
+        .route(
+            "/v1/sessions/{profile}/{session}",
+            get(sessions::get_session),
+        )
         .route(
             "/v1/sessions/{profile}/{session}/recover",
             post(sessions::recover_session),

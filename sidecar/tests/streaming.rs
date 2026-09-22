@@ -24,15 +24,13 @@ fn temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
-fn fixture_session_with_email(email: &str) -> (Arc<gaze_hermes_sidecar::sessions::SessionHandle>, String) {
+fn fixture_session_with_email(
+    email: &str,
+) -> (Arc<gaze_hermes_sidecar::sessions::SessionHandle>, String) {
     let dir = temp_dir("fixture");
     let store = Arc::new(PolicyStore::open(&dir.join("policies")).unwrap());
     let effective = store.effective(None).unwrap();
-    let locale_tags = effective
-        .policy
-        .locale
-        .clone()
-        .unwrap_or_default();
+    let locale_tags = effective.policy.locale.clone().unwrap_or_default();
     let dictionaries = gaze::DictionaryBundle::default();
     let session = gaze::Session::new(gaze::Scope::Conversation("stream-fixture".into())).unwrap();
     let mut tx = session.begin_transaction();
@@ -83,9 +81,16 @@ fn interleaved_lanes_keep_independent_carries() {
     let (session, token) = fixture_session_with_email(EMAIL);
     let mut r = StreamRestorer::new(session.clone());
     let mid = token.len() / 2;
-    let mid = if token.is_char_boundary(mid) { mid } else { mid + 1 };
+    let mid = if token.is_char_boundary(mid) {
+        mid
+    } else {
+        mid + 1
+    };
     assert_eq!(r.feed(1, "text", &token[..mid]).unwrap(), "");
-    assert_eq!(r.feed(2, "reasoning", "thinking...").unwrap(), "thinking...");
+    assert_eq!(
+        r.feed(2, "reasoning", "thinking...").unwrap(),
+        "thinking..."
+    );
     assert_eq!(r.feed(3, "text", &token[mid..]).unwrap(), EMAIL);
     r.finish().unwrap();
 }
@@ -113,7 +118,11 @@ fn finish_with_dangling_token_prefix_fails() {
     let (session, token) = fixture_session_with_email(EMAIL);
     let mut r = StreamRestorer::new(session.clone());
     let mid = token.len() / 2;
-    let mid = if token.is_char_boundary(mid) { mid } else { mid + 1 };
+    let mid = if token.is_char_boundary(mid) {
+        mid
+    } else {
+        mid + 1
+    };
     r.feed(1, "text", &token[..mid]).unwrap();
     let err = r.finish().unwrap_err();
     assert!(matches!(err, StreamError::StrictRestore));

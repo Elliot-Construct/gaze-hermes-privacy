@@ -56,10 +56,7 @@ pub struct EditedPolicy {
 
 pub fn rule_identity(kind: &str, class: Option<&str>, column: Option<&str>) -> String {
     match kind {
-        "class" => format!(
-            "class:{}",
-            class.unwrap_or_default()
-        ),
+        "class" => format!("class:{}", class.unwrap_or_default()),
         "column" => format!("column:{}", column.unwrap_or_default()),
         "default" => "default".to_string(),
         other => format!("kind:{other}"),

@@ -59,7 +59,11 @@ fn temp_store(tag: &str, global: &str) -> (PathBuf, PolicyStore) {
 }
 
 fn write_profile(dir: &Path, profile_id: &str, overlay: &str) {
-    std::fs::write(dir.join("profiles").join(format!("{profile_id}.toml")), overlay).unwrap();
+    std::fs::write(
+        dir.join("profiles").join(format!("{profile_id}.toml")),
+        overlay,
+    )
+    .unwrap();
 }
 
 #[test]
@@ -561,10 +565,7 @@ fn fake_provisioner_ensure_returns_configured_path_without_network() {
     let fake = FakeProvisioner {
         path: PathBuf::from("/models/fake-bundle"),
     };
-    assert_eq!(
-        fake.ensure().unwrap(),
-        PathBuf::from("/models/fake-bundle")
-    );
+    assert_eq!(fake.ensure().unwrap(), PathBuf::from("/models/fake-bundle"));
 }
 
 #[test]

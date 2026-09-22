@@ -23,7 +23,9 @@ pub async fn edit_policy(
     let edited = state
         .policies
         .edit(request.scope, &request.expected_hash, request.edit)?;
-    Ok(Json(serde_json::json!({ "toml": edited.toml, "hash": edited.hash })))
+    Ok(Json(
+        serde_json::json!({ "toml": edited.toml, "hash": edited.hash }),
+    ))
 }
 
 pub async fn apply_policy(
@@ -77,8 +79,7 @@ pub async fn test_policy(
     let effective = super::effective_for_profile(&state.policies, &request.namespace.profile_id)?;
     let session = gaze::Session::new(gaze::Scope::Conversation(format!(
         "policy-test-{}-{}",
-        request.namespace.session_id,
-        request.namespace.request_id
+        request.namespace.session_id, request.namespace.request_id
     )))
     .map_err(|err| ApiError::Internal(err.to_string()))?;
 

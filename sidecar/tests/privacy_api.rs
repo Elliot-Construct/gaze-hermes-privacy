@@ -148,7 +148,12 @@ async fn multi_field_clean_commits_all_or_nothing() {
     let enc_count = std::fs::read_dir(&session_dir)
         .unwrap()
         .filter(|e| {
-            e.as_ref().unwrap().path().extension().and_then(|x| x.to_str()) == Some("enc")
+            e.as_ref()
+                .unwrap()
+                .path()
+                .extension()
+                .and_then(|x| x.to_str())
+                == Some("enc")
         })
         .count();
     assert_eq!(enc_count, 1);

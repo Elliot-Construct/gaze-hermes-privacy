@@ -100,11 +100,17 @@ fn rule_identity_of(value: &Value) -> Option<String> {
     Some(match kind {
         "class" => format!(
             "class:{}",
-            table.get("class").and_then(|v| v.as_str()).unwrap_or_default()
+            table
+                .get("class")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
         ),
         "column" => format!(
             "column:{}",
-            table.get("column").and_then(|v| v.as_str()).unwrap_or_default()
+            table
+                .get("column")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
         ),
         "default" => "default".to_string(),
         other => format!("kind:{other}"),
