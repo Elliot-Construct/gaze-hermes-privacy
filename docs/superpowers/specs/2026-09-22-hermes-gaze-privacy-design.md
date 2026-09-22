@@ -353,6 +353,10 @@ The plugin must never silently claim mandatory protection on an unsupported Herm
 
 ## 12. Request Lifecycle
 
+For a protected provider, the plugin must inspect the complete outbound provider payload, not merely the latest user message. Text-bearing fields that may contain PII include system prompts, conversation messages, tool-call arguments/results, tool descriptions, response-schema text, and other provider-specific textual fields.
+
+The Python plugin is responsible for adapting Hermes/provider-native request and response objects into a canonical sidecar envelope and reconstructing the provider-native objects afterwards. The sidecar remains provider-agnostic and operates on explicitly identified transformable fields rather than acting as a provider/router.
+
 For a protected provider:
 
 1. Hermes prepares the provider request.
@@ -374,6 +378,19 @@ For a protected provider:
 12. Sanitised debugging/metrics events are recorded.
 
 The reversible mapping must never be returned to the Python plugin in normal operation.
+
+### 12.1 Structured and multimodal payloads
+
+Structured payloads are supported only when every outbound field that may carry PII is either safely transformed or explicitly classified as non-sensitive metadata.
+
+For v1, the privacy guarantee applies to supported text-bearing fields. Binary attachments, images, audio, opaque blobs, provider-native objects with unknown semantics, or any other field that Gaze cannot inspect must not be silently forwarded to an external provider in mandatory mode. The plugin must either:
+
+- handle the field through a supported privacy transformation path; or
+- block the request as an unsupported provider payload shape.
+
+Trusted-local providers remain exempt according to the explicit allowlist.
+
+The Desktop debug view should surface when a request was blocked because of unsupported multimodal or opaque content.
 
 ## 13. Sidecar REST API
 
@@ -432,6 +449,8 @@ The response must not include the reversible mapping.
 Streaming restoration is required in v1.
 
 The plugin uses an authenticated WebSocket connection to the sidecar for each protected provider stream.
+
+Provider-native stream objects are adapted by the Python plugin into canonical string-bearing deltas plus non-sensitive metadata. Only transformable textual deltas pass through the sidecar restoration state machine; the plugin then reconstructs the provider-native stream object before yielding it back to Hermes. Unknown or opaque stream fields are not assumed safe.
 
 Conceptual endpoint:
 
