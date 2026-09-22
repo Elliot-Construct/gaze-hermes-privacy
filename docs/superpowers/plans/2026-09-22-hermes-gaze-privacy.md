@@ -395,6 +395,7 @@ class PrivacyConfig:
     sidecar_url: str
     trusted_local_providers: frozenset[str]
     mandatory_mode: bool
+    compatibility_mode: bool
     api_token_file: Path
     master_key_file: Path
     global_policy_file: Path
@@ -427,6 +428,7 @@ class PrivacyConfig:
             sidecar_url=str(sidecar.get("url", "http://127.0.0.1:65113")),
             trusted_local_providers=frozenset(map(str, providers.get("trusted_local", []))),
             mandatory_mode=bool(security.get("mandatory", True)),
+            compatibility_mode=bool(security.get("compatibility_mode", False)),
             api_token_file=Path(sidecar.get("api_token_file", home / "secrets" / "api-token")),
             master_key_file=Path(sidecar.get("master_key_file", home / "secrets" / "snapshot-key")),
             global_policy_file=Path(raw.get("policy", {}).get("global_file", home / "policies" / "global.toml")),
@@ -434,7 +436,7 @@ class PrivacyConfig:
         )
 ```
 
-The implementation must use `GAZE_HERMES_HOME` when set; otherwise resolve `hermes_constants.get_default_hermes_root()` and append `gaze-hermes-privacy`, so host-scoped state is not accidentally placed inside whichever profile happens to load the plugin first. Default `sidecar_mode` is `"native"`, default `sidecar_scope` is `"host"`, default URL is `http://127.0.0.1:65113`, and `mandatory_mode` defaults true.
+The implementation must use `GAZE_HERMES_HOME` when set; otherwise resolve `hermes_constants.get_default_hermes_root()` and append `gaze-hermes-privacy`, so host-scoped state is not accidentally placed inside whichever profile happens to load the plugin first. Default `sidecar_mode` is `"native"`, default `sidecar_scope` is `"host"`, default URL is `http://127.0.0.1:65113`, `mandatory_mode` defaults true, and `compatibility_mode` defaults false.
 
 - [ ] **Step 4: Implement exact-match provider policy**
 
@@ -1690,12 +1692,22 @@ def test_missing_hermes_privacy_capabilities_block_external(runtime):
 def test_missing_capabilities_still_allow_explicit_trusted_local(runtime):
     runtime.capabilities = HermesCapabilities(fail_closed=False, stream_text=False)
     runtime.provider_policy = ProviderPolicy(frozenset({"local-vllm"}))
-    assert runtime.protection_decision("local-vllm") == "bypass"
+    before = runtime.fake_sidecar.clean_calls
+    result = runtime.execute(
+        provider="local-vllm",
+        next_call=lambda request: fake_response(),
+        request=payload(),
+        api_mode="chat_completions",
+        session_id="s1",
+        api_request_id="r1",
+    )
+    assert result is not None
+    assert runtime.fake_sidecar.clean_calls == before
 
 
 def test_compatibility_mode_marks_external_call_not_guaranteed(runtime):
     runtime.capabilities = HermesCapabilities(fail_closed=False, stream_text=False)
-    runtime.config = replace(runtime.config, mandatory_mode=False, compatibility_mode=True)
+    runtime.config = replace(runtime.config, compatibility_mode=True)
     runtime.execute(
         provider="openrouter",
         next_call=lambda request: fake_response(),
@@ -1728,7 +1740,7 @@ class PrivacyRuntime:
             self.events.record_bypass(provider=provider, **ctx)
             return next_call(request)
 
-        self.require_fail_closed_capabilities()
+        self.require_or_mark_capabilities(provider=provider, context=ctx)
 
         from hermes_constants import get_hermes_home, profile_name_for_home
         profile_id = profile_name_for_home(get_hermes_home()) or "default"
@@ -1777,7 +1789,7 @@ def llm_stream_text_middleware(
 ):
     if runtime.provider_policy.classify(provider) is ProtectionDecision.BYPASS:
         return {"text": text}
-    runtime.require_fail_closed_capabilities()
+    runtime.require_or_mark_capabilities(provider=provider, context=_ctx)
     key = (
         str(profile_id or "default"),
         str(session_id or ""),
@@ -1785,6 +1797,23 @@ def llm_stream_text_middleware(
     )
     stream = runtime.streams.get_or_open(key)
     return {"text": stream.feed(kind=kind, text=text)}
+```
+
+Implement capability gating once in `PrivacyRuntime`:
+
+```python
+def require_or_mark_capabilities(self, *, provider: str, context: dict) -> None:
+    if self.capabilities.fail_closed and self.capabilities.stream_text:
+        return
+    if self.config.compatibility_mode:
+        self.events.record(
+            state="protection_not_guaranteed",
+            provider=provider,
+            reason="hermes_capability_missing",
+            **context,
+        )
+        return
+    raise PrivacyBlockedError("Hermes lacks required fail-closed privacy capabilities")
 ```
 
 `StreamRegistry.reserve(namespace, client=managed.client)` runs before `next_call` and stores the exact profile-aware client selected by `SidecarManager` under `(profile_id, session_id, api_request_id)`. `get_or_open()` lazily opens that client's authenticated sidecar WebSocket on the first live delta and rejects an unknown request key. This avoids relying on implicit cross-profile uniqueness or a `ContextVar` crossing Hermes' streaming worker threads, and avoids opening a WebSocket for non-streaming calls. Trusted-local streams pass through unchanged.
