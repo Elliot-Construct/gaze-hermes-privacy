@@ -1922,6 +1922,7 @@ import {
   TabsList,
   TabsTrigger,
   useQuery,
+  useQueryClient,
   useValue,
   host
 } from '@hermes/plugin-sdk'
@@ -1961,29 +1962,80 @@ The current Hermes Desktop SDK exports `Tabs`, `TabsList`, and `TabsTrigger`; it
 
 - [ ] **Step 3: Implement Overview**
 
-Fetch `/status` with React Query and show:
-- protection state;
-- sidecar health/mode/version;
-- NER status/version;
-- effective policy hash;
-- protected/bypassed/blocked counters;
-- Hermes fail-closed and stream-transform capability state.
+Fetch `/status` with React Query and show protection state, sidecar/NER versions, policy hash, counters, and Hermes capability state.
 
-No hard-coded colours; use SDK components and theme variables.
+```javascript
+function usePrivacyStatus(ctx) {
+  return useQuery({
+    queryKey: [ID, 'status'],
+    queryFn: () => ctx.rest('/status'),
+    refetchInterval: 3000
+  })
+}
+
+function Overview({ ctx }) {
+  const query = usePrivacyStatus(ctx)
+  if (query.isPending) return jsx('div', { children: 'Loading privacy status' })
+  if (query.isError) return jsx('div', { children: 'Privacy status unavailable' })
+  const s = query.data
+  return jsxs('div', {
+    children: [
+      jsx('h2', { children: s.protection_state }),
+      jsx('div', { children: 'Sidecar: ' + s.sidecar.mode + ' ' + s.sidecar.version }),
+      jsx('div', { children: 'Policy: ' + s.policy_hash }),
+      jsx('div', { children: 'Protected ' + s.counters.protected + ' · Bypassed ' + s.counters.bypassed + ' · Blocked ' + s.counters.blocked }),
+      jsx('div', { children: 'Fail-closed ' + (s.capabilities.fail_closed ? 'yes' : 'no') + ' · Stream transform ' + (s.capabilities.stream_text ? 'yes' : 'no') })
+    ]
+  })
+}
+```
+
+No hard-coded colours; use SDK components and theme variables for any styling added around this structure.
 
 - [ ] **Step 4: Implement Live Debug**
 
-Use `ctx.socket('/events', onEvent)` when available and React Query polling fallback because Desktop sockets are no-op on OAuth remotes. `onEvent` must only invalidate/refill the sanitised event query; it must not persist raw event bodies in plugin storage. Render request timeline metadata only.
+Use `ctx.socket('/events', onEvent)` when available and React Query polling fallback because Desktop sockets are no-op on OAuth remotes. `onEvent` only invalidates the sanitised query.
+
+```javascript
+function usePrivacyEvents(ctx) {
+  const queryClient = useQueryClient()
+  const query = useQuery({
+    queryKey: [ID, 'events'],
+    queryFn: () => ctx.rest('/events?limit=200'),
+    refetchInterval: 5000
+  })
+
+  useEffect(() => {
+    return ctx.socket('/events', () => {
+      void queryClient.invalidateQueries({ queryKey: [ID, 'events'] })
+    })
+  }, [ctx, queryClient])
+
+  return query
+}
+```
+
+The event renderer displays request ID, provider/model, PII classes/counts, decision, latency, streaming state and errors only. It never writes event bodies to `ctx.storage`.
 
 - [ ] **Step 5: Implement status-bar state**
 
-Map current status to:
-- Protected;
-- Local bypass;
-- Blocked;
-- Error.
+Map current status to `Protected`, `Local bypass`, `Blocked`, or `Error`. Clicking the status item navigates to `/gaze-privacy`.
 
-Clicking the status item navigates to `/gaze-privacy`.
+```javascript
+function PrivacyStatus({ ctx }) {
+  const query = usePrivacyStatus(ctx)
+  const label = query.isError
+    ? 'Error'
+    : query.isPending
+      ? 'Checking privacy'
+      : query.data.protection_state
+  return jsx(Button, {
+    variant: 'ghost',
+    onClick: () => host.navigate(PATH),
+    children: label
+  })
+}
+```
 
 - [ ] **Step 6: Run Desktop tests**
 
