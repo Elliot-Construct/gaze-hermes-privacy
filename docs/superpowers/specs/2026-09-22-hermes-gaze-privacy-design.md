@@ -10,7 +10,7 @@
 
 Hermes itself remains inside the trusted boundary. Local Hermes processes, tools, files, memory, MCP servers, terminal commands, and document-generation workflows may continue to use real PII. The plugin applies reversible pseudonymisation specifically at the boundary where Hermes sends data to an external model provider, then restores the provider response locally before Hermes processes assistant content or tool calls.
 
-The project must remain vendor-neutral. It must not contain DataWyse-specific branding, policy defaults, organisation names, deployment assumptions, or proprietary configuration.
+The project must remain vendor-neutral. It must not contain company-specific branding, policy defaults, organisation names, deployment assumptions, or proprietary configuration.
 
 ## 2. Success Criteria
 
