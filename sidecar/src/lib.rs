@@ -1,0 +1,6 @@
+//! Gaze Hermes privacy sidecar library surface for integration tests and the binary.
+
+pub mod api;
+pub mod auth;
+pub mod config;
+pub mod protocol;
