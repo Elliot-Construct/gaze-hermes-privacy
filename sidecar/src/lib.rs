@@ -3,4 +3,6 @@
 pub mod api;
 pub mod auth;
 pub mod config;
+pub mod model;
+pub mod policies;
 pub mod protocol;

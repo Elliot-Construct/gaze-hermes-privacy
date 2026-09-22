@@ -1,0 +1,23 @@
+schema_version = "0.1.0"
+
+[session]
+scope = "conversation"
+
+[policy.rulepacks]
+bundled = ["core"]
+
+[[policy.custom_recognizers]]
+kind = "regex"
+name = "employee_id"
+pattern = '\bEMP-[0-9]{5}\b'
+class = "custom:employee_id"
+
+[[rule]]
+kind = "class"
+class = "custom:employee_id"
+action = "tokenize"
+
+[[rule]]
+kind = "class"
+class = "email"
+action = "tokenize"

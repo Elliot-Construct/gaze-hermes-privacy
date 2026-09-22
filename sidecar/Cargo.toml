@@ -16,6 +16,13 @@ thiserror = "2"
 subtle = "2.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+gaze = { package = "gaze-pii", version = "=0.14.0" }
+gaze-assembly = "=0.14.0"
+gaze-recognizers = "=0.14.0"
+gaze-model-setup = "=0.14.0"
+toml = "0.9"
+toml_edit = "0.23"
+sha2 = "0.10"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
