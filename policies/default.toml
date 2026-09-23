@@ -1,0 +1,27 @@
+schema_version = "0.1.0"
+
+[session]
+scope = "conversation"
+
+[policy.rulepacks]
+bundled = ["core"]
+
+[[rule]]
+kind = "class"
+class = "email"
+action = "tokenize"
+
+[[rule]]
+kind = "class"
+class = "name"
+action = "tokenize"
+
+[[rule]]
+kind = "class"
+class = "location"
+action = "tokenize"
+
+[[rule]]
+kind = "class"
+class = "organization"
+action = "tokenize"

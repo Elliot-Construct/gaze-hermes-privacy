@@ -1,0 +1,138 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-matrix:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            sidecar/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache Python
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/pyproject.toml') }}
+
+      - name: Build Rust
+        run: cargo build --locked --release --manifest-path sidecar/Cargo.toml --target ${{ matrix.target }}
+
+      - name: Run Rust tests
+        run: cargo test --locked --manifest-path sidecar/Cargo.toml --target ${{ matrix.target }}
+
+      - name: Install Python deps
+        run: pip install -e .[dev]
+
+      - name: Run Python tests
+        run: pytest tests/python -v
+
+      - name: Run Desktop tests
+        if: runner.os == 'Linux'
+        run: |
+          node --check desktop/plugin.js
+          npm run test:desktop
+
+  linux-quality:
+    needs: test-matrix
+    if: runner.os == 'Linux'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            sidecar/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install Python deps
+        run: pip install -e .[dev]
+
+      - name: cargo fmt --check
+        run: cargo fmt --manifest-path sidecar/Cargo.toml -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --manifest-path sidecar/Cargo.toml --all-targets -- -D warnings
+
+      - name: Desktop ESM tests
+        run: |
+          node --check desktop/plugin.js
+          npm run test:desktop
+
+      - name: Synthetic e2e tests
+        run: pytest tests/e2e -v
+
+      - name: Docker smoke
+        run: |
+          docker compose config
+          bash scripts/docker-smoke.sh
+
+      - name: Forbidden fixture scan
+        run: |
+          grep -r "alice@example\.com\|bob@example\.com\|real.*email\|real.*phone" tests/ --include="*.py" --include="*.json" || true

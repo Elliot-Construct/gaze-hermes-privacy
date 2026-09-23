@@ -1,0 +1,6 @@
+{
+  "name": "gaze-hermes-privacy",
+  "label": "Gaze Privacy",
+  "version": "0.1.0",
+  "api": "plugin_api.py"
+}

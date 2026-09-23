@@ -1,0 +1,11 @@
+schema_version = "0.1.0"
+
+[session]
+scope = "conversation"
+
+[policy.rulepacks]
+bundled = ["core-extended"]
+
+[[rule]]
+kind = "default"
+action = "tokenize"
