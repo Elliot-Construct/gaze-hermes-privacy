@@ -77,10 +77,10 @@ def llm_stream_text_middleware(
 
     runtime.require_or_mark_capabilities(provider=provider, context=context)
 
-    key = (
-        str(session_id or ""),
-        str(api_request_id or ""),
+    return runtime.stream_text_sync(
+        text=text,
+        kind=kind,
+        provider=provider,
+        session_id=session_id,
+        api_request_id=api_request_id,
     )
-    stream = runtime.streams.get_or_open(key)
-    restored = stream.feed_sync(kind=kind, text=text)
-    return {"text": restored}

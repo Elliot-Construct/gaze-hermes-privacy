@@ -34,8 +34,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sessions = if let Some(master_key_path) = &config.master_key_file {
         let master_key = std::fs::read(master_key_path)
             .map_err(|e| format!("Failed to read master key file: {}", e))?;
-        let key: [u8; 32] = master_key.try_into().map_err(|_| "Master key must be 32 bytes")?;
-        Arc::new(SessionRegistry::open_with_master_key(&data_dir.join("sessions"), key)?)
+        let key: [u8; 32] = master_key
+            .try_into()
+            .map_err(|_| "Master key must be 32 bytes")?;
+        Arc::new(SessionRegistry::open_with_master_key(
+            &data_dir.join("sessions"),
+            key,
+        )?)
     } else {
         Arc::new(SessionRegistry::open(&data_dir.join("sessions"))?)
     };

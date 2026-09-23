@@ -48,6 +48,9 @@ def register(ctx):
     # Store runtime in plugin context for middleware access
     ctx.runtime = runtime
 
+    # Track activation state for mandatory mode enforcement
+    runtime._activation_state = "active" if capabilities.fail_closed and capabilities.stream_text else "blocked"
+
     # Register execution middleware
     if capabilities.fail_closed:
         ctx.register_middleware(
@@ -67,7 +70,7 @@ def register(ctx):
     # Register backend API for Desktop using Hermes' supported mechanism
     # Note: ctx.register_api is not a standard Hermes API; use ctx.register_backend_api or similar if available
     # For now, we'll attach the API router to the runtime for middleware access
-    runtime.plugin_api_service = None  # Will be set by init_runtime via PluginApiService.from_runtime
+    
 
 
 def llm_execution_middleware(*, request, next_call, provider, api_mode, **ctx):

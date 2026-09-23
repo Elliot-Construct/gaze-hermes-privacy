@@ -239,14 +239,62 @@ class PrivacyRuntime:
         api_mode: str,
         **context: Any,
     ) -> Any:
-        """Synchronous execution for Hermes middleware."""
-        return self.bridge.call(self.execute(
-            request=request,
-            next_call=next_call,
-            provider=provider,
-            api_mode=api_mode,
-            **context,
-        ))
+        """Synchronous execution for Hermes middleware.
+        
+        CRITICAL: This method runs synchronously on the Hermes thread.
+        Only sidecar I/O operations are delegated to the AsyncBridge thread.
+        The `next_call` provider callback runs on the Hermes thread.
+        """
+        from gaze_privacy.provider_policy import ProtectionDecision
+        import asyncio
+
+        if self.provider_policy.classify(provider) is ProtectionDecision.BYPASS:
+            self.events.add(
+                create_event(
+                    provider=provider,
+                    api_mode=api_mode,
+                    session_id=context.get("session_id", ""),
+                    profile_id=self.resolve_profile_id(),
+                    request_id=context.get("api_request_id", ""),
+                    state="bypass",
+                )
+            )
+            return next_call(request)
+
+        self.require_or_mark_capabilities(provider=provider, context=context)
+
+        profile_id = self.resolve_profile_id()
+        managed = self.bridge.call(self.sidecars.ensure_running(profile_id))
+
+        namespace = {
+            "profile_id": profile_id,
+            "session_id": context.get("session_id", ""),
+            "request_id": context.get("api_request_id", ""),
+        }
+
+        prepared = extract_request_fields(api_mode, request, mandatory=self.config.mandatory_mode)
+        cleaned = self.bridge.call(managed.client.clean(namespace, prepared.fields))
+        protected_request = prepared.apply(cleaned["fields"])
+
+        stream = self.bridge.call(managed.client.open_stream(namespace))
+        key = self.streams.reserve(namespace, client=stream)
+        try:
+            # CRITICAL: next_call runs on the Hermes thread (current thread)
+            response = next_call(protected_request)
+            
+            restored = self.bridge.call(restore_completed_response(
+                managed.client,
+                namespace,
+                api_mode,
+                response,
+            ))
+            self.streams.finish(key, self.bridge)
+            return restored
+        except Exception:
+            self.streams.abort(key, self.bridge)
+            raise
+        finally:
+            self.streams.release(key)
 
     async def stream_text(
         self,
