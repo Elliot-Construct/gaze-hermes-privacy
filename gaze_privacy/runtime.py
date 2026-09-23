@@ -246,7 +246,6 @@ class PrivacyRuntime:
         The `next_call` provider callback runs on the Hermes thread.
         """
         from gaze_privacy.provider_policy import ProtectionDecision
-        import asyncio
 
         if self.provider_policy.classify(provider) is ProtectionDecision.BYPASS:
             self.events.add(

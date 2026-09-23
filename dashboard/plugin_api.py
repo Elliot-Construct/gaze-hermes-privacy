@@ -9,7 +9,7 @@ from gaze_privacy.plugin_api_service import PluginApiService
 router = APIRouter()
 
 
-def _service() -> PluginApiService:
+def _service() -> "PluginApiService":
     """Get the plugin API service, raising appropriate errors if unavailable."""
     try:
         runtime = get_runtime()

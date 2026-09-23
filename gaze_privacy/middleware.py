@@ -51,7 +51,27 @@ def llm_execution_middleware(
     **context: Any,
 ) -> Any:
     """llm_execution middleware callback for Hermes (synchronous)."""
-    return get_runtime().execute_sync(
+    runtime = get_runtime()
+    
+    # Check activation state first - block if not fully activated
+    if runtime._activation_state == "blocked":
+        if runtime.config.mandatory_mode:
+            raise PrivacyBlockedError("Hermes lacks required fail-closed privacy capabilities for mandatory mode")
+        # In compatibility mode, allow through but mark as unprotected
+        runtime.events.add(
+            create_event(
+                provider=provider,
+                api_mode=api_mode,
+                session_id=context.get("session_id", ""),
+                profile_id=context.get("profile_id", "default"),
+                request_id=context.get("api_request_id", ""),
+                state="protection_not_guaranteed",
+                error_code="hermes_capability_missing",
+            )
+        )
+        return next_call(request)
+    
+    return runtime.execute_sync(
         request=request,
         next_call=next_call,
         provider=provider,

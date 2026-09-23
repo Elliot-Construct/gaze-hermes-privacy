@@ -49,18 +49,25 @@ def register(ctx):
     ctx.runtime = runtime
 
     # Track activation state for mandatory mode enforcement
-    runtime._activation_state = "active" if capabilities.fail_closed and capabilities.stream_text else "blocked"
+    # Only "active" if both capabilities are present
+    has_full_caps = capabilities.fail_closed and capabilities.stream_text
+    runtime._activation_state = "active" if has_full_caps else "blocked"
 
-    # Register execution middleware
-    if capabilities.fail_closed:
-        ctx.register_middleware(
-            "llm_execution",
-            llm_execution_middleware,
-            failure_mode="closed",
-        )
+    # In mandatory mode without required capabilities, block activation entirely
+    if config.mandatory_mode and not has_full_caps:
+        runtime._activation_state = "blocked"
+        # Don't register execution middleware - let the activation check block external calls
     else:
-        # Compatibility mode: register without failure_mode
-        ctx.register_middleware("llm_execution", llm_execution_middleware)
+        # Register execution middleware only if we have fail_closed support
+        if capabilities.fail_closed:
+            ctx.register_middleware(
+                "llm_execution",
+                llm_execution_middleware,
+                failure_mode="closed",
+            )
+        else:
+            # Compatibility mode: register without failure_mode
+            ctx.register_middleware("llm_execution", llm_execution_middleware)
 
     # Register streaming middleware if supported
     if capabilities.stream_text:
@@ -69,7 +76,6 @@ def register(ctx):
 
     # Register backend API for Desktop using Hermes' supported mechanism
     # Note: ctx.register_api is not a standard Hermes API; use ctx.register_backend_api or similar if available
-    # For now, we'll attach the API router to the runtime for middleware access
     
 
 
